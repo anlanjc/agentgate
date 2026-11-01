@@ -32,9 +32,18 @@ _PG_TABLES = ("usage_records", "task_records", "virtual_keys", "channels", "tena
 
 @pytest.fixture(scope="session")
 def pg_url() -> str | None:
-    """AGENTGATE_TEST_PG=1 时启动内嵌 PostgreSQL 16(pgserver),返回 SQLAlchemy URL。"""
+    """AGENTGATE_TEST_PG=1 时启用 PG 口径,返回 SQLAlchemy URL。
+
+    两种供给(优先级):
+    1. AGENTGATE_TEST_PG_URL —— 外部 PG(CI 用 postgres service;URL 需含 +asyncpg 或自动补);
+    2. 未提供则本地 pgserver(内嵌 PostgreSQL 16,自动 initdb)。
+    """
     if not os.environ.get("AGENTGATE_TEST_PG"):
         yield None
+        return
+    external = os.environ.get("AGENTGATE_TEST_PG_URL")
+    if external:
+        yield external.replace("postgresql://", "postgresql+asyncpg://", 1)
         return
     import pgserver
 

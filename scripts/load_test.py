@@ -13,6 +13,7 @@
 
 import argparse
 import asyncio
+import os
 import socket
 import statistics
 import time
@@ -130,13 +131,15 @@ async def main() -> None:
     from app.upstream.client import UpstreamClient
     from tests.mock_upstream import build_mock_upstream
 
+    # DB 方言可经 AGENTGATE_DB_URL 切 PG(ADR-002 双口径压测);默认 SQLite
+    db_url = os.environ.get("AGENTGATE_DB_URL", "sqlite+aiosqlite:///./load_test.db")
     settings = Settings(
         upstream_name="mock",
         upstream_base_url="http://mock/v1",
         upstream_api_key="sk-loadtest",
         upstream_read_timeout=30.0,
         models=["mock-model"],
-        db_url="sqlite+aiosqlite:///./load_test.db",
+        db_url=db_url,
         redis_url="redis://127.0.0.1:6379/2",
         auth_enabled=True,
         log_level="WARNING",
@@ -144,9 +147,7 @@ async def main() -> None:
     redis = aredis.from_url(settings.redis_url, decode_responses=True, protocol=2)
     await redis.flushdb()
 
-    import os
-
-    if os.path.exists("load_test.db"):
+    if db_url.startswith("sqlite") and os.path.exists("load_test.db"):
         os.remove("load_test.db")  # 幂等:清掉上次的库(避免 UNIQUE 冲突)
 
     mock_app = build_mock_upstream()
@@ -157,6 +158,13 @@ async def main() -> None:
     )
     app = create_app(settings=settings, upstream=upstream, redis_client=redis)
     await init_db(app.state.engine)
+    if db_url.startswith("postgres"):
+        # PG 是持久库:重跑前清表(SQLite 走上面的删文件路径)
+        from sqlalchemy import text
+
+        async with app.state.engine.begin() as conn:
+            for t in ("usage_records", "task_records", "virtual_keys", "channels", "tenants"):
+                await conn.execute(text(f"TRUNCATE TABLE {t} CASCADE"))
 
     raw, key_hash, prefix = generate_key()
     async with build_session_factory(app.state.engine)() as db:
@@ -207,7 +215,7 @@ async def main() -> None:
         report = f"""# agentgate 压测报告(脚本自动生成)
 
 - 时间:{time.strftime("%Y-%m-%d %H:%M:%S")}
-- 环境:Windows 本机 · Python 3.12 · 便携 Redis 5.0.14 · SQLite · mock 上游(进程内,近零延迟)· aiohttp 客户端
+- 环境:Windows 本机 · Python 3.12 · 便携 Redis 5.0.14 · DB={'PostgreSQL 16(pgserver)' if 'postgres' in db_url else 'SQLite'} · mock 上游(进程内,近零延迟)· aiohttp 客户端
 - 参数:容量组总请求 {args.requests}(非流式 {n_plain} / 流式 {n_stream})· 并发 {args.concurrency}
 
 ## 每请求附加开销(c=1,无排队 —— 合法口径)

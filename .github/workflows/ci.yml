@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  test-sqlite:
     runs-on: ubuntu-latest
     services:
       redis:
@@ -28,5 +28,44 @@ jobs:
         run: pip install -r requirements.txt
       - name: Lint
         run: ruff check app tests scripts
-      - name: Test(真 Redis 集成口径;PG 待 compose job 扩展)
+      - name: Test(SQLite 方言)
+        run: pytest tests -q
+
+  test-pg:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Test(PostgreSQL 16 方言 —— 双口径 CI 强制)
+        env:
+          AGENTGATE_TEST_PG: "1"
+          AGENTGATE_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: pytest tests -q
