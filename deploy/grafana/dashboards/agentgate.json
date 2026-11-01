@@ -1,0 +1,75 @@
+{
+  "title": "agentgate 网关",
+  "uid": "agentgate-main",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "请求速率(按状态类)",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum by (status_class) (rate(agentgate_requests_total[1m]))", "legendFormat": "{{status_class}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT 分位(流式首 token,ms)—— 慢在上游还是网关的第一判据",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(agentgate_ttft_ms_bucket[5m])) by (le))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(agentgate_ttft_ms_bucket[5m])) by (le))", "legendFormat": "P95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(agentgate_ttft_ms_bucket[5m])) by (le))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "非流式请求延迟 P95(按渠道,ms)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(agentgate_request_latency_ms_bucket[5m])) by (le, channel))", "legendFormat": "{{channel}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "token 消耗速率(按租户/类型)",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "sum by (tenant, kind) (rate(agentgate_tokens_total[5m]))", "legendFormat": "{{tenant}}/{{kind}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "响应缓存命中率",
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+      "targets": [
+        { "expr": "sum(agentgate_cache_hits_total) / clamp_min(sum(agentgate_cache_hits_total) + sum(agentgate_cache_misses_total), 1)", "legendFormat": "hit rate" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "记账队列积压(应≈0)",
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+      "targets": [
+        { "expr": "max(agentgate_usage_queue_depth)", "legendFormat": "depth" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "渠道冷却数",
+      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 6 },
+      "targets": [
+        { "expr": "sum(agentgate_channel_cooling)", "legendFormat": "cooling" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "记账丢弃(正常=0)",
+      "gridPos": { "x": 18, "y": 16, "w": 6, "h": 6 },
+      "targets": [
+        { "expr": "sum(agentgate_usage_dropped_total)", "legendFormat": "dropped" }
+      ]
+    }
+  ]
+}
