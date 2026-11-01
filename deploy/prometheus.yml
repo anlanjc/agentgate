@@ -1,0 +1,6 @@
+scrape_configs:
+  - job_name: agentgate
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["gateway:8100"]
+    metrics_path: /metrics

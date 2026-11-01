@@ -1,0 +1,70 @@
+# agentgate 生产拓扑:gateway + PostgreSQL 16 + Redis 7(AOF)+ Prometheus + Grafana
+# 用法:cd deploy && docker compose up -d
+# 本机无 Docker 时的等价开发路径见 README「无 Docker 快速开始」(ADR-002)
+
+services:
+  gateway:
+    build: ..
+    ports:
+      - "8100:8100"
+    environment:
+      AGENTGATE_DB_URL: postgresql+asyncpg://agentgate:agentgate@postgres:5432/agentgate
+      AGENTGATE_REDIS_URL: redis://redis:6379/0
+      AGENTGATE_UPSTREAM_BASE_URL: ${AGENTGATE_UPSTREAM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      AGENTGATE_UPSTREAM_API_KEY: ${AGENTGATE_UPSTREAM_API_KEY:-}
+      AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:-change-me}
+      AGENTGATE_LLM_TRUST_ENV: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentgate
+      POSTGRES_PASSWORD: agentgate
+      POSTGRES_DB: agentgate
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # 任务流持久化:重启不丢 Streams(ADR-003)
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3300:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+
+volumes:
+  pgdata:
+  redisdata:
