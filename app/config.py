@@ -1,0 +1,39 @@
+"""应用配置(pydantic-settings,环境变量前缀 AGENTGATE_)。"""
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="AGENTGATE_", env_file=".env", extra="ignore")
+
+    app_name: str = "agentgate"
+    host: str = "127.0.0.1"
+    port: int = 8100
+    log_level: str = "INFO"
+
+    # 存储(ADR-002):默认 SQLite 零依赖起步,生产 compose 注入 postgres+asyncpg
+    db_url: str = "sqlite+aiosqlite:///./agentgate.db"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+
+    # 上游渠道(M0 单渠道;M2 换渠道注册表+故障转移)
+    upstream_name: str = "dashscope-compat"
+    upstream_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    upstream_api_key: str = ""
+    upstream_connect_timeout: float = 5.0
+    upstream_read_timeout: float = 300.0
+    # 该机注册表系统代理坑:LLM 上游必须直连绕过环境代理(PC 会话教训)
+    llm_trust_env: bool = False
+
+    # /v1/models 暴露的模型清单(演示口径)
+    models: list[str] = ["qwen-plus", "qwen-turbo", "qwen-max"]
+
+    # M1:鉴权与多租户(auth_enabled=False 为纯代理模式,仅 M0 语义/测试用)
+    auth_enabled: bool = True
+    admin_token: str = ""  # 为空时 admin API 不设防(仅限本机开发)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
