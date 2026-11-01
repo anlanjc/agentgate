@@ -90,6 +90,15 @@ def create_app(
             content=generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8"
         )
 
+    @app_.get("/admin/web")
+    async def admin_web():
+        from pathlib import Path
+
+        from starlette.responses import FileResponse
+
+        page = Path(__file__).resolve().parents[2] / "app" / "web" / "index.html"
+        return FileResponse(page, media_type="text/html")
+
     return app_
 
 

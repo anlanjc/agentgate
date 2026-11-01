@@ -43,6 +43,16 @@ USAGE_DROPPED = Counter(
     "记账队列溢出丢弃数(正常应为 0)",
 )
 
+CACHE_HITS = Counter(
+    "agentgate_cache_hits_total",
+    "精确响应缓存命中数(仅 temperature≤0 非流式无工具请求参与缓存)",
+)
+
+CACHE_MISSES = Counter(
+    "agentgate_cache_misses_total",
+    "精确响应缓存未命中数",
+)
+
 CHANNEL_COOLING = Gauge(
     "agentgate_channel_cooling",
     "渠道是否冷却中(1=冷却,0=健康)",

@@ -6,6 +6,7 @@
 - 渠道健康状态(EMA 延迟/冷却)存 Redis,多副本共享。
 """
 
+import json
 import time
 from collections.abc import AsyncIterator
 
@@ -17,6 +18,7 @@ from starlette.background import BackgroundTask
 
 from app.auth import keys as auth_keys
 from app.auth.keys import AuthResult, KeyInactive, KeyNotFound
+from app.cache import response as response_cache
 from app.db.models import Tenant
 from app.errors import GatewayError
 from app.log import current_request_id, get_logger
@@ -51,9 +53,7 @@ def _retry_after_s(resp: httpx.Response) -> int:
 
 def _classify_upstream_exc(exc: Exception) -> tuple[int, str, str]:
     """传输异常 → (状态码, message, code)。真超时=504;对端中断/连不上=502。"""
-    import httpx as _hx
-
-    if isinstance(exc, _hx.ReadTimeout) or isinstance(exc, _hx.WriteTimeout):
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout)):
         return 504, "upstream timeout", "upstream_timeout"
     return 502, "upstream unreachable", "upstream_connect_failed"
 
@@ -336,6 +336,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     # 注意:传 make_record 本身(可调用),后台任务执行时才求值 —— 流式 usage 在流结束才可知
 
     # ---- 非流式 ----
+    # 响应缓存(默认关;只缓确定性请求,租户隔离键,语义见 app/cache/response.py)
+    rkey = None
+    if auth is not None and response_cache.cache_enabled(state.settings, req):
+        rkey = response_cache.cache_key(auth.tenant_id, req.model, payload)
+        cached = await response_cache.get(state.redis, rkey)
+        if cached is not None:
+            metrics.CACHE_HITS.inc()
+            logger.info("cache_hit", request_id=request_id)
+            record = _record(auth, req.model, request_id, 200, cached.get("usage"), None, 0, channel="cache")
+            metrics.REQUESTS.labels(
+                tenant=auth.tenant_id, channel="cache", status_class="2xx"
+            ).inc()
+            return Response(
+                content=json.dumps(cached, ensure_ascii=False).encode(),
+                status_code=200,
+                media_type="application/json",
+                headers={"x-cache": "HIT", "x-upstream-channel": "cache"},
+                background=BackgroundTask(_account, request, auth, record),
+            )
+        metrics.CACHE_MISSES.inc()
+
     t0 = time.perf_counter()
     try:
         channel, resp = await _dispatch_non_stream(state, payload, forward_headers)
@@ -347,11 +368,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 
     latency_ms = (time.perf_counter() - t0) * 1000
     usage = None
+    body_json = None
     if resp.status_code == 200:
         try:
-            usage = resp.json().get("usage")
+            body_json = resp.json()
+            usage = body_json.get("usage")
         except ValueError:
             usage = None
+        if rkey is not None and body_json is not None:
+            await response_cache.put(state.redis, rkey, body_json, state.settings.response_cache_ttl)
     record = _record(
         auth, req.model, request_id, resp.status_code, usage, None, latency_ms,
         channel=channel or "",
@@ -371,11 +396,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
         metrics.TOKENS.labels(tenant=tenant_label, model=req.model, kind="completion").inc(
             usage.get("completion_tokens", 0)
         )
+    extra_headers = {"x-upstream-channel": channel or "exhausted"}
+    if rkey is not None:
+        extra_headers["x-cache"] = "MISS"
     return Response(
         content=resp.content,
         status_code=resp.status_code,
         media_type="application/json",
-        headers={"x-upstream-channel": channel or "exhausted"},
+        headers=extra_headers,
         background=BackgroundTask(_account, request, auth, record),
     )
 

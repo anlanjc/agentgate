@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>agentgate 管理台</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --line:#21262d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; padding:24px; }
+  h1 { font-size:20px; margin-bottom:4px; } h1 span { color:var(--acc); }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .card h2 { font-size:14px; color:var(--acc); margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .ok { background:rgba(63,185,80,.15); color:var(--ok); } .cool { background:rgba(248,81,73,.15); color:var(--bad); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  input, select { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:13px; }
+  .row { display:flex; gap:8px; margin:8px 0; flex-wrap:wrap; }
+  .keybox { margin-top:8px; padding:8px; background:#0d1117; border:1px dashed var(--warn); border-radius:6px; font-family:Consolas, monospace; font-size:12px; color:var(--warn); word-break:break-all; display:none; }
+  .muted { color:var(--dim); }
+  #toast { position:fixed; bottom:20px; right:20px; background:var(--card); border:1px solid var(--acc); border-radius:8px; padding:10px 14px; display:none; }
+</style>
+</head>
+<body>
+  <h1>agentgate <span>管理台</span></h1>
+  <div class="sub">多租户 LLM/Agent 网关 · 渠道健康 / 租户与 key / 用量对账 · <span id="ver"></span></div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>渠道健康(排障第一屏)</h2>
+      <table id="ch"><thead><tr><th>渠道</th><th>EMA 延迟</th><th>状态</th><th>连续失败</th></tr></thead><tbody></tbody></table>
+      <div class="row" style="margin-top:10px">
+        <input id="chName" placeholder="渠道名" style="width:110px">
+        <input id="chUrl" placeholder="http://127.0.0.1:PORT/v1" style="flex:1">
+        <input id="chModels" placeholder="模型,逗号分隔" style="width:150px">
+        <button onclick="registerChannel()">注册渠道</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>租户</h2>
+      <div class="row">
+        <input id="tName" placeholder="租户名" style="flex:1">
+        <button onclick="createTenant()">创建租户</button>
+        <button class="ghost" onclick="purgeCache()">清空响应缓存</button>
+      </div>
+      <table id="tn"><thead><tr><th>ID</th><th>名称</th><th>Webhook</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>签发 virtual key(raw key 只显示一次)</h2>
+      <div class="row">
+        <select id="kTenant" style="flex:1"></select>
+        <input id="kRpm" type="number" value="60" style="width:80px" title="RPM">
+        <input id="kTpm" type="number" value="100000" style="width:110px" title="TPM">
+        <input id="kBudget" type="number" placeholder="预算 token(空=不限)" style="width:150px">
+        <button onclick="issueKey()">签发</button>
+      </div>
+      <div id="keyOut" class="keybox"></div>
+    </div>
+
+    <div class="card">
+      <h2>用量对账</h2>
+      <div class="row"><select id="uTenant" style="flex:1" onchange="loadUsage()"></select><button class="ghost" onclick="loadUsage()">刷新</button></div>
+      <table id="usage"><thead><tr><th>请求数</th><th>总 token</th><th>分模型</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; setTimeout(()=>t.style.display='none',2500); };
+const api = (p, opt) => fetch('/admin'+p, opt).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error?.message || r.status); return j; });
+
+async function loadChannels(){
+  const {channels} = await api('/channels');
+  $('#ch tbody').innerHTML = channels.map(c => `<tr>
+    <td><b>${c.name}</b><div class="muted">${(c.models||[]).join(', ')||'—'}</div></td>
+    <td>${c.ema_ms} ms</td>
+    <td>${c.cooling ? '<span class="pill cool">冷却中</span>' : '<span class="pill ok">健康</span>'}</td>
+    <td>${c.fail_streak}</td></tr>`).join('');
+}
+async function registerChannel(){
+  const models = $('#chModels').value.split(',').map(s=>s.trim()).filter(Boolean);
+  await api('/channels', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:$('#chName').value, base_url:$('#chUrl').value, models})});
+  toast('渠道已注册'); loadChannels();
+}
+async function loadTenants(){
+  const {tenants} = await api('/tenants');
+  $('#tn tbody').innerHTML = tenants.map(t => `<tr>
+    <td class="muted">${t.id.slice(0,8)}…</td><td>${t.name}</td>
+    <td class="muted">${t.webhook_url ? '已配置' : '—'}</td>
+    <td><button class="ghost" onclick="pickTenant('${t.id}')">选入签发/对账</button></td></tr>`).join('');
+  const opts = tenants.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
+  $('#kTenant').innerHTML = opts; $('#uTenant').innerHTML = opts;
+}
+function pickTenant(id){ $('#kTenant').value = id; $('#uTenant').value = id; loadUsage(); }
+async function createTenant(){
+  const {id} = await api('/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:$('#tName').value})});
+  toast('租户已创建 '+id.slice(0,8)); loadTenants();
+}
+async function issueKey(){
+  const body = {name:'web', rpm_limit:+$('#kRpm').value, tpm_limit:+$('#kTpm').value};
+  if ($('#kBudget').value) body.budget_tokens = +$('#kBudget').value;
+  const {key} = await api(`/tenants/${$('#kTenant').value}/keys`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const out = $('#keyOut'); out.style.display='block'; out.textContent = 'raw key(仅此一次): '+key;
+}
+async function loadUsage(){
+  const tid = $('#uTenant').value; if (!tid) return;
+  const u = await api(`/tenants/${tid}/usage`);
+  $('#usage tbody').innerHTML = `<tr><td>${u.requests}</td><td>${u.total_tokens}</td>
+    <td class="muted">${Object.entries(u.by_model).map(([m,v])=>`${m}×${v.requests}`).join(' · ')||'—'}</td></tr>`;
+}
+async function purgeCache(){
+  const {purged} = await api('/cache', {method:'DELETE'});
+  toast('已清空 '+purged+' 条缓存');
+}
+(async () => {
+  $('#ver').textContent = 'v' + (await (await fetch('/health')).json()).version;
+  await loadChannels(); await loadTenants();
+  if ($('#uTenant').value) await loadUsage();
+  setInterval(loadChannels, 5000);  // 渠道健康 5s 自刷新
+})();
+</script>
+</body>
+</html>

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     auth_enabled: bool = True
     admin_token: str = ""  # 为空时 admin API 不设防(仅限本机开发)
 
+    # M5:精确响应缓存(默认关闭;只缓 temperature≤0 的非流式无工具请求,租户隔离见 app/cache/response.py)
+    response_cache_enabled: bool = False
+    response_cache_ttl: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -131,7 +131,6 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     进程内测试请直接调 ChannelRouter.register(不走本端点)。
     """
     _require_admin(request)
-    import httpx
 
     from app.router.failover import ChannelRouter
     from app.upstream.client import UpstreamClient
@@ -149,3 +148,50 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     )
     router.register(body.name, client, body.models)
     return {"channel": body.name, "models": body.models, "registered": True}
+
+
+@router.delete("/cache")
+async def purge_response_cache(request: Request) -> dict:
+    """全量清空精确响应缓存(TTL 惰性失效之外的主动手段;无按 key 精确失效 —— 见 response.py 语义)。"""
+    _require_admin(request)
+    removed = 0
+    async for key in request.app.state.redis.scan_iter(match="resp:*", count=500):
+        await request.app.state.redis.delete(key)
+        removed += 1
+    return {"purged": removed}
+
+
+@router.get("/channels")
+async def list_channels(request: Request) -> dict:
+    """渠道注册表 + 运行态健康(EMA/冷却/连续失败)—— 管理界面与排障第一屏。"""
+    import time
+
+    from app.router.failover import _state_key
+
+    router = request.app.state.channel_router
+    now_ms = int(time.time() * 1000)
+    out = []
+    for name in router.names:
+        raw = await request.app.state.redis.hgetall(_state_key(name))
+        out.append(
+            {
+                "name": name,
+                "models": router._models.get(name, []),
+                "ema_ms": round(float(raw.get("ema_ms", 1000) or 1000), 1),
+                "cooling": int(raw.get("cooldown_until_ms", 0) or 0) > now_ms,
+                "fail_streak": int(raw.get("fail_streak", 0) or 0),
+            }
+        )
+    return {"channels": out}
+
+
+@router.get("/tenants")
+async def list_tenants(request: Request) -> dict:
+    _require_admin(request)
+    async with request.app.state.session_factory() as db:
+        from sqlalchemy import select
+
+        from app.db.models import Tenant as T
+
+        rows = (await db.execute(select(T.id, T.name, T.webhook_url).order_by(T.created_at))).all()
+        return {"tenants": [{"id": r[0], "name": r[1], "webhook_url": r[2]} for r in rows]}
