@@ -1,0 +1,7 @@
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 3215fe6889f5, init schema
+[1] PostgreSQL 16.2 on x86_64-pc-mingw64 @ 127.0.0.1:53174/postgres
+[2] alembic upgrade head 完成
+[3] PG 表验证通过: ['channels', 'task_records', 'tenants', 'usage_records', 'virtual_keys']
+✅ 迁移在真 PostgreSQL 上验证通过

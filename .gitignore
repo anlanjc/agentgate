@@ -18,3 +18,5 @@ ag_migrate_tmp.db
 
 # 本会话工具(便携 Redis)
 .tooling/
+.pgdata/
+*.log
