@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-import httpx  # noqa: E402
+import httpx
 
 
 def _free_port() -> int:
