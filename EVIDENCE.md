@@ -1,0 +1,85 @@
+# EVIDENCE · agentgate(2026-11-01/02,AG-1 会话)
+
+> 纪律:mock 与 real、SQLite 与 PG、真 Redis 与 fakeredis 口径严格分列;每条数字带环境与命令。
+
+## ① 测试证据
+
+- **pytest 39/39 全绿**(42s,Windows 本机 Python 3.12.4)
+  - 命令:`.venv/Scripts/python -m pytest tests -q`
+  - 组成:M0 协议代理 11 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · 观测/杂项 5
+  - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
+  - 故障注入面:进程内 mock 上游(429/500/慢/断流)+ 真实 TCP(装死服务器→读超时、discard 端口→拒连)+ 关 Redis(路由降级)
+
+## ② 核心验收数字(对照 PROGRESS 里程碑)
+
+| 验收项 | 目标 | 实测 | 口径 |
+|---|---|---|---|
+| 每请求附加开销 | < 10ms | **3.70ms** ✅ | c=1 无排队;过网关 P50 4.09ms − 直连 P50 0.39ms;`scripts/load_test.py`(evidence/load_report.md) |
+| 并发扣减零超卖 | 桶硬上界 | **100 并发恰放行 50**(容量 50)✅ | 真 Redis Lua,`test_bucket_concurrent_zero_oversell` |
+| 记账原子性 | 零丢失 | **100 并发恰 1800 token、账本 100 行** ✅ | `test_concurrent_accounting_atomic` |
+| 故障注入:全渠道 500 | 透传+降级 | 透传最后错误,渠道头=exhausted;Redis 关停路由降级不崩 ✅ | `test_all_channels_fail_passthrough` / `test_redis_down_router_degrades` |
+| 任务不丢不重 | at-least-once+幂等 | 重复投递被状态机吞掉;崩溃(ghost consumer)后 XCLAIM 收编;3 次失败进死信 ✅ | `test_m2_streams` |
+| webhook 端到端 | 幂等投递 | 幂等键=request_id,真 HTTP(uvicorn 随机端口)恰好收到 1 次 ✅ | `test_webhook_e2e` |
+| 可观测 | TTFT/分维度 | /metrics 暴露 REQUESTS/TOKENS/TTFT/USAGE_QUEUE_DEPTH/CHANNEL_* | `GET /metrics` |
+
+## ③ 调优叙事(压测的方法论与前后对比)
+
+- **教训 1(压测第一课)**:首版数字 142 req/s、P50 335ms —— 瓶颈是 **httpx 纯 Python 客户端自身**
+  (c=1 时网关实为 P50 3.3ms)。换 aiohttp(C 解析器)+ 差值法后数字才可信。
+- **教训 2(口径)**:c=50 的中位差 120ms 是**排队延迟**(单进程 CPU 串行 ~3ms/req × 50 并发),
+  不是每请求代价 —— 附加开销必须在 c=1 无排队下测。修正后 **3.70ms 达标**。
+- **组件分解**(c=50 服务时间):裸 mock 0.34ms → +httpx 转发跳 0.7ms → +鉴权/准入/路由/记账 ≈ 2.8ms。
+- **已做优化**(测试全绿保护下):朴素 EVAL → EVALSHA;准入 3 次往返 → 单 Lua 1 次;鉴权缓存命中零
+  DB 会话;记账 INCRBY+窗口 → pipeline;路由 EMA 读改写 → 原子 Lua。**每请求 Redis 往返 8→5**。
+- **诚实结论**:单进程绝对吞吐受 GIL/事件循环约束(本机 Proactor ~300-450 req/s;Selector 实测
+  c=50 略好但 c=1 更差,未采纳);生产 `uvicorn --workers N` 水平扩展,与 LiteLLM 部署形态一致。
+
+## ④ 环境与口径分列
+
+- 本机(今日全部数字):Windows 10.0.26300 · Python 3.12.4 · **SQLite**(aiosqlite)+ **便携 Redis 5.0.14.1**
+  (tporadowski,Lua/Streams/XCLAIM 验证可用;RESP2 protocol=2 与 redis-py 8.1 兼容)
+- 生产(compose 交付,未在本机跑):PostgreSQL 16 + Redis 7(AOF)+ Prometheus + Grafana
+- **PG/Redis7 口径数字:待 Docker 就绪后用同一套测试复跑**(ADR-002;tests 默认方言中立,切换=DB_URL)
+- 上游:进程内 mock(近零延迟)→ 本报告=网关自身性能;**DashScope 真实冒烟见 §⑤**
+
+## ⑤ DashScope 真实冒烟(2026-11-02 00:31,已通过)
+
+- **链路**:真 HTTP → uvicorn 网关 → 鉴权/Lua 准入 → httpx(trust_env=False 直连)→ DashScope OpenAI 兼容端点
+- **非流式**:200 OK · 780ms · usage=31 tokens · 回复正常 · channel=dashscope
+- **流式**:200 OK · **TTFT 133ms** · 总延迟 303ms · 11 chunks · usage=35 tokens · SSE 透传含 usage 提取
+- **账本对账**:2 行 · 总 66 tokens(后台异步记账落库成功);花费 ≈ ¥0.00005(≤¥2 红线,余量全留)
+- **诚实记录**:qwen-turbo 当前账号配额耗尽(`limit_requests` 429 ×6 次退避重试确认)→ 换 **qwen-flash** 通过;
+  过程中网关的 **429 透传 + 渠道冷却 + 恢复后重试** 被真实上游活体验证(503 no_channel_available 信封格式正确)
+- 命令:`python scripts/smoke_real.py`;报告:evidence/real_smoke.md;key 读 policy-compass/.env,未落任何日志
+
+## ⑤+ M4 生态演练(2026-11-02,通过)—— 故障注入抓到两个真 bug
+
+- **演练剧本**(`scripts/demo_ecosystem.py`,真实多进程):子进程起 agent-a/agent-b 两个 Agent 服务 →
+  网关真 HTTP → admin API 注册渠道 → 正常请求记账 → **kill -9 agent-a** → **10ms 自动切换 agent-b,
+  客户端零感知**,账本照记;`scripts/agent_shim_example.py` = AskBI/PC(自有 JSON 协议)接入的通用
+  OpenAI shim 模板(生产接入 = 起一个 shim 进程 + admin API 注册,应用零改动)。
+- **故障注入收获 #1(真 bug)**:kill -9 造成连接重置,httpx 抛 `ReadError`/`RemoteProtocolError`
+  —— 原分类元组漏接 → **未处理 500**。修复:UPSTREAM_TRANSPORT_ERRORS 统一捕获做 failover,
+  `_classify_upstream_exc` 按类型映射(对端中断/连不上=502,真超时=504);回归测试
+  `test_upstream_connection_reset_maps_502`(真实 TCP abort=RST 语义)钉死。这正是"故障注入的价值"的活案例。
+- **故障注入收获 #2**:空 api_key 渠道发 `Authorization: Bearer `(空值)→ httpx 拒绝本地协议错误
+  → `_build_headers` 空 key 不发该头(内网 Agent 服务无 key 的真实场景)。
+- **诚实注记**:演练日志中一次 `usage_write_failed`(sqlite 文件锁,系此前被强杀的孤儿进程遗留,
+  环境残留非代码缺陷)——写库失败时网关按设计降级未崩,单写者队列的可观测路径(`usage_write_failed`
+  事件)工作正常。
+
+## ⑥ 面试素材索引
+
+- "为什么 Python 不是 Java/Go" → ADR-001(证据链:LiteLLM 8ms P95@1k RPS / JD 0/30 必须 Java / 下沉触发条件)
+- "高并发怎么保证不多发" → 硬点 2(Lua 原子 + 并发恰放行测试)
+- "消息不丢不重" → 硬点 4(at-least-once + 幂等键 + XCLAIM 恢复,三层测试)
+- "线上慢怎么查" → TTFT 与总延迟分开记(慢在上游还是网关)+ USAGE_QUEUE_DEPTH(落库跟不上可见)
+- "为什么不用 Celery" → ADR-003(黑盒 vs 可讲透;接口预留换实现边界)
+- "压测怎么做的" → §③(客户端瓶颈教训 + 口径修正,这是真实踩坑不是背的)
+
+## ⑦ 留给用户
+
+1. Docker 就绪后:`cd deploy && docker compose up -d` → 同套测试在 PG/Redis7 复跑(补 §④ 数字)
+2. 三仓 push(CI 含真 Redis 服务容器)
+3. M4(下一窗口):AskBI/PolicyCompass 注册为网关渠道(自家网关管自家 Agent)+ MCP server 暴露
+4. 可选:Grafana 面板 JSON、PG 账单表按月分区、滑动窗口 TPM

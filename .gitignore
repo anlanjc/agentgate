@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 本机运行产物(不入库)
+*.db
+load_test.db
+smoke_real.db
+agentgate.db
+demo_gw.db
+probe*.db
+ag_migrate_tmp.db
+
+# 环境与密钥
+.env
+
+# 本会话工具(便携 Redis)
+.tooling/
