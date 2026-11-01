@@ -20,7 +20,7 @@ AB = ROOT.parent / "askbi"
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-import httpx  # noqa: E402
+import httpx
 
 
 def _free_port() -> int:
@@ -85,15 +85,15 @@ async def main() -> None:
         print(f"[2] AskBI shim 就绪 :{port_shim}")
 
         # 3) 网关(默认渠道 = askbi shim)
+        import redis.asyncio as aredis
+        import uvicorn
+
         from app.api.main import create_app
         from app.auth.keys import generate_key
         from app.config import Settings
         from app.db.models import Tenant, VirtualKey
         from app.db.session import build_session_factory, init_db
         from app.upstream.client import UpstreamClient
-
-        import redis.asyncio as aredis
-        import uvicorn
 
         if os.path.exists("ab_gw.db"):
             os.remove("ab_gw.db")

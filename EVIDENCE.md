@@ -1,6 +1,8 @@
 # EVIDENCE · agentgate(2026-11-01/02,AG-1 会话)
 
 > 纪律:mock 与 real、SQLite 与 PG、真 Redis 与 fakeredis 口径严格分列;每条数字带环境与命令。
+> 2026-11-02 增强批次后:TPM 升级为**双窗口滑动近似**(固定窗口交界 ~2× 突刺的局限消除,
+> 经典 weighted sliding window,O(1) 两键轮转;test_m1_quota 原语义测试零改动通过)。
 
 ## ① 测试证据
 
