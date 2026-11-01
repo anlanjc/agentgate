@@ -4,11 +4,12 @@
 
 ## ① 测试证据
 
-- **pytest 39/39 全绿**(42s,Windows 本机 Python 3.12.4)
-  - 命令:`.venv/Scripts/python -m pytest tests -q`
-  - 组成:M0 协议代理 11 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · 观测/杂项 5
+- **47/47 全绿(SQLite 方言)+ 47/47 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-02)
+  - 命令:`.venv/Scripts/python -m pytest tests -q`;PG 口径:`AGENTGATE_TEST_PG=1` 同命令
+  - 组成:M0 协议代理 12 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · M4 渠道注册 1 · M5 缓存 5 · MCP 1 · 观测/杂项 5
   - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
-  - 故障注入面:进程内 mock 上游(429/500/慢/断流)+ 真实 TCP(装死服务器→读超时、discard 端口→拒连)+ 关 Redis(路由降级)
+  - 故障注入面:进程内 mock 上游(429/500/慢/断流)+ 真实 TCP(装死→读超时、discard→拒连、abort→RST 重置)+ 关 Redis(路由降级)
+- **Alembic 迁移在真 PostgreSQL 验证通过**:`scripts/verify_pg_migration.py`(evidence/pg_migration.txt)——upgrade head + 5 表齐全;幂等可重跑
 
 ## ② 核心验收数字(对照 PROGRESS 里程碑)
 
@@ -67,6 +68,22 @@
 - **诚实注记**:演练日志中一次 `usage_write_failed`(sqlite 文件锁,系此前被强杀的孤儿进程遗留,
   环境残留非代码缺陷)——写库失败时网关按设计降级未崩,单写者队列的可观测路径(`usage_write_failed`
   事件)工作正常。
+
+## ⑤++ 增强批次(2026-11-02,4亿 token 窗口)—— 六项全部通过
+
+| # | 项 | 结果 | 证据 |
+|---|---|---|---|
+| 1 | **真 PostgreSQL 双口径** | 47/47 SQLite + 47/47 PG 16.2(pgserver 内嵌);Alembic 迁移真 PG 验证 | 本节 §①;ADR-002 已升级 |
+| 2 | **多 worker 水平扩展** | **1.00x → 2.15x → 4.04x**(workers 1/2/4,1200 req @ c=50)——共享状态全在 Redis 的多副本设计被实测验证 | evidence/load_workers.md |
+| 3 | **MCP server**(2026 JD 命中) | 4 工具(渠道健康/用量对账/预算读数/签发 key)真 stdio 握手;**MCP 签发的 key 立即可用于网关**——共享状态面证明,非旁路 | test_m5_mcp(真子进程握手) |
+| 4 | **精确响应缓存** | 租户隔离键(安全边界)/确定性门控(temperature≤0 非流式无 tools)/X-Cache 头/命中率指标/账本 channel=cache/管理端清空 | test_m5_cache 5 项 |
+| 5 | **管理界面** | 单文件 web(/admin/web):渠道健康(EMA 实测)5s 自刷/租户/签发 key(只显示一次)/用量对账/清缓存 | docs/screenshots/admin_web.png(浏览器真渲染) |
+| 6 | **PolicyCompass 实接** | **真 PC(CRAG,mock LLM)穿网关答题**:OpenAI 请求 → 网关(Lua 准入)→ shim → PC /api/chat;两问 200,937ms/710 字与 889ms/638 字真实语料答案,渠道头 policy-compass,账本落库 | evidence/pc_gateway.md;scripts/demo_pc_gateway.py |
+
+- 实接踩坑记录(诚实):①PC 路由挂 `/api` 前缀(/health 404 → /api/health);②PC 必须用系统 python
+  (agent venv 无 langgraph/jieba);③首版演示 bootstrap 假渠道按字母序抢走流量(EMA 同为默认值)
+  → 砍假渠道让 PC 即默认渠道;④PC 无 token 计量,shim 上报 usage=0,账本 token=0 是诚实记录。
+- pgserver 运维坑:被强杀后残留 postmaster.pid/进程锁 → taskkill postgres + 删 .pgdata 重建(测试库无状态)。
 
 ## ⑥ 面试素材索引
 

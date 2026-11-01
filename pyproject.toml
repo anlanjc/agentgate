@@ -22,3 +22,10 @@ target-version = "py312"
 # BLE001:网关降级语义有意盲捕(Redis 挂→降级、解析失败→跳过),均带日志,见各处注释
 # RUF059:循环解包约定(`for _stream, messages in ...`)以 `_` 前缀表达意图
 ignore = ["BLE001", "RUF059"]
+
+[tool.ruff.lint.per-file-ignores]
+# 演示/压测编排脚本:清理路径 try-pass 与 async 内起子进程是有意编排(非热路径)
+"scripts/demo_*.py" = ["S110", "ASYNC220"]
+"scripts/load_workers.py" = ["S110", "ASYNC220"]
+"scripts/load_test.py" = ["S110", "ASYNC220"]
+"scripts/smoke_real.py" = ["S110", "ASYNC220"]
