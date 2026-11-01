@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     response_cache_enabled: bool = False
     response_cache_ttl: int = 300
 
+    # M5+:语义缓存(默认关闭;HashEmbedder 词面相似/生产换 DashScopeEmbedder,见 app/cache/semantic.py)
+    semantic_cache_enabled: bool = False
+    semantic_cache_threshold: float = 0.92
+    semantic_cache_ttl: int = 600
+    embed_api_key: str = ""
+    embed_api_base: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

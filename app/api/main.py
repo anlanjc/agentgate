@@ -62,6 +62,21 @@ def create_app(
     )
     app_.state.ttft_samples = deque(maxlen=1000)  # M0 观测占位,M3 换 Prometheus 直方图
 
+    # 语义缓存 embedder(默认关;有 EMBED key 用真 embedding,否则 HashEmbedder 词面口径)
+    if settings.semantic_cache_enabled:
+        if settings.embed_api_key:
+            from app.cache.semantic import DashScopeEmbedder
+
+            app_.state.embedder = DashScopeEmbedder(
+                settings.embed_api_key,
+                base_url=settings.embed_api_base or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                trust_env=settings.llm_trust_env,
+            )
+        else:
+            from app.cache.semantic import HashEmbedder
+
+            app_.state.embedder = HashEmbedder()
+
     # M2:渠道注册表(默认渠道 = settings 指向的上游)+ 任务队列(webhook 回调)
     from app.queue.streams import TaskQueue
     from app.queue.webhooks import webhook_handler

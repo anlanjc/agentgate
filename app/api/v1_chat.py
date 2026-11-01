@@ -19,6 +19,7 @@ from starlette.background import BackgroundTask
 from app.auth import keys as auth_keys
 from app.auth.keys import AuthResult, KeyInactive, KeyNotFound
 from app.cache import response as response_cache
+from app.cache import semantic as semantic_cache
 from app.db.models import Tenant
 from app.errors import GatewayError
 from app.log import current_request_id, get_logger
@@ -338,10 +339,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     # ---- 非流式 ----
     # 响应缓存(默认关;只缓确定性请求,租户隔离键,语义见 app/cache/response.py)
     rkey = None
+    exact_hit = False
     if auth is not None and response_cache.cache_enabled(state.settings, req):
         rkey = response_cache.cache_key(auth.tenant_id, req.model, payload)
         cached = await response_cache.get(state.redis, rkey)
         if cached is not None:
+            exact_hit = True
             metrics.CACHE_HITS.inc()
             logger.info("cache_hit", request_id=request_id)
             record = _record(auth, req.model, request_id, 200, cached.get("usage"), None, 0, channel="cache")
@@ -356,6 +359,40 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 background=BackgroundTask(_account, request, auth, record),
             )
         metrics.CACHE_MISSES.inc()
+
+    # 语义缓存(精确未命中时):问题向量召回,阈值以上直接复用答案
+    if auth is not None and not exact_hit and semantic_cache.semantic_enabled(state.settings, req):
+        question = next(
+            (m.content for m in reversed(req.messages) if m.role == "user" and isinstance(m.content, str)),
+            "",
+        )
+        if question:
+            hit = await semantic_cache.search(
+                state.redis, state.embedder, auth.tenant_id, req.model,
+                question, state.settings.semantic_cache_threshold,
+            )
+            if hit is not None:
+                metrics.CACHE_HITS.inc()
+                logger.info("semantic_cache_hit", request_id=request_id, score=hit["score"])
+                record = _record(
+                    auth, req.model, request_id, 200,
+                    hit["answer"].get("usage"), None, 0, channel="cache-semantic",
+                )
+                metrics.REQUESTS.labels(
+                    tenant=auth.tenant_id, channel="cache-semantic", status_class="2xx"
+                ).inc()
+                return Response(
+                    content=json.dumps(hit["answer"], ensure_ascii=False).encode(),
+                    status_code=200,
+                    media_type="application/json",
+                    headers={
+                        "x-cache": "SEMANTIC_HIT",
+                        "x-cache-score": str(hit["score"]),
+                        "x-upstream-channel": "cache-semantic",
+                    },
+                    background=BackgroundTask(_account, request, auth, record),
+                )
+            metrics.CACHE_MISSES.inc()
 
     t0 = time.perf_counter()
     try:
@@ -377,6 +414,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             usage = None
         if rkey is not None and body_json is not None:
             await response_cache.put(state.redis, rkey, body_json, state.settings.response_cache_ttl)
+        # 语义缓存入库(精确与语义同源;问题取最后一条 user 消息)
+        if (
+            auth is not None
+            and semantic_cache.semantic_enabled(state.settings, req)
+            and body_json is not None
+        ):
+            question = next(
+                (m.content for m in reversed(req.messages) if m.role == "user" and isinstance(m.content, str)),
+                "",
+            )
+            if question:
+                await semantic_cache.store(
+                    state.redis, state.embedder, auth.tenant_id, req.model,
+                    question, body_json, state.settings.semantic_cache_ttl,
+                )
     record = _record(
         auth, req.model, request_id, resp.status_code, usage, None, latency_ms,
         channel=channel or "",
