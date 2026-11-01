@@ -8,7 +8,7 @@ import httpx
 import pytest
 import uvicorn
 
-from app.db.session import build_engine, build_session_factory, init_db
+from app.db.session import init_db
 from app.queue.streams import DLQ_STREAM, GROUP, TASK_STREAM, TaskQueue
 from tests.mock_upstream import build_mock_upstream
 
@@ -20,10 +20,14 @@ def _body(**extra) -> dict:
 
 
 @pytest.fixture
-async def queue_env(tmp_path, redis_client):
-    engine = build_engine(f"sqlite+aiosqlite:///{tmp_path}/tasks.db")
-    await init_db(engine)
-    sf = build_session_factory(engine)
+async def queue_env(tmp_path, redis_client, pg_url):
+    from app.db.session import build_engine as _be
+    from app.db.session import build_session_factory as _bsf
+    from app.db.session import init_db as _idb
+
+    engine = _be(pg_url or f"sqlite+aiosqlite:///{tmp_path}/tasks.db")
+    await _idb(engine)
+    sf = _bsf(engine)
     received: list[dict] = []
 
     async def handler(task_type: str, payload: dict) -> dict:

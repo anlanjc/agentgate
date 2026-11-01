@@ -56,7 +56,7 @@ async def _two_channel_app(auth_settings, redis_client, case_a: str, case_b: str
 
 
 @pytest.fixture
-def auth_settings(tmp_path):
+def auth_settings(tmp_path, pg_url):
     from app.config import Settings
 
     return Settings(
@@ -64,7 +64,7 @@ def auth_settings(tmp_path):
         upstream_base_url="http://mock/v1",
         upstream_api_key="sk-test",
         models=["mock-model"],
-        db_url=f"sqlite+aiosqlite:///{tmp_path}/t.db",
+        db_url=pg_url or f"sqlite+aiosqlite:///{tmp_path}/t.db",
         redis_url="redis://127.0.0.1:6379/1",
         auth_enabled=True,
     )

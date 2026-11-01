@@ -1,4 +1,4 @@
-"""测试装配:mock 上游 + 网关 app,全程进程内 ASGI(超时/拒连用例除外,走真 TCP)。
+"""测试装配:mock 上游 + 网关 app,全程进程内 ASGI(超时/拒连/重置用例除外,走真 TCP)。
 
 双模式:
 - gateway:M0 纯代理语义(auth_enabled=False,适配边缘已鉴权的内网部署);
@@ -6,7 +6,12 @@
 
 Redis:优先真 Redis(127.0.0.1:6379/1,便携 5.0.14),不可用降级 fakeredis;
 flavor 记录在 client._flavor,EVIDENCE 分列口径。
+
+DB 方言(ADR-002):默认 SQLite(aiosqlite);设 AGENTGATE_TEST_PG=1 时用 pgserver 内嵌
+PostgreSQL 16 全量复跑 —— 同一套测试,双口径分列(每种方言各自的表隔离策略见下)。
 """
+
+import os
 
 import httpx
 import pytest
@@ -22,15 +27,49 @@ from tests.mock_upstream import build_mock_upstream
 TENANT_ID = "t-test"
 KEY_ID = "k-test"
 
+_PG_TABLES = ("usage_records", "task_records", "virtual_keys", "channels", "tenants")
 
-def _base_settings(tmp_path, **overrides) -> Settings:
+
+@pytest.fixture(scope="session")
+def pg_url() -> str | None:
+    """AGENTGATE_TEST_PG=1 时启动内嵌 PostgreSQL 16(pgserver),返回 SQLAlchemy URL。"""
+    if not os.environ.get("AGENTGATE_TEST_PG"):
+        yield None
+        return
+    import pgserver
+
+    db = pgserver.get_server(os.path.join(os.path.dirname(__file__), "..", ".pgdata"))
+    uri = db.get_uri()  # postgresql://postgres:@host:port/postgres
+    yield uri.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+
+@pytest.fixture(autouse=True)
+async def _pg_clean(pg_url):
+    """PG 口径:测试间清表(SQLite 靠 tmp_path 文件隔离,PG 共库需显式清理)。"""
+    yield
+    if pg_url is None:
+        return
+    from sqlalchemy import text
+
+    from app.db.session import build_engine
+
+    engine = build_engine(pg_url)
+    try:
+        async with engine.begin() as conn:
+            for t in _PG_TABLES:
+                await conn.execute(text(f"TRUNCATE TABLE {t} CASCADE"))
+    finally:
+        await engine.dispose()
+
+
+def _base_settings(tmp_path, pg_url: str | None = None, **overrides) -> Settings:
     defaults: dict = {
         "upstream_name": "mock",
         "upstream_base_url": "http://mock/v1",
         "upstream_api_key": "sk-test",
         "upstream_read_timeout": 1.0,
         "models": ["mock-model"],
-        "db_url": f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        "db_url": pg_url or f"sqlite+aiosqlite:///{tmp_path}/test.db",
         "redis_url": "redis://127.0.0.1:6379/1",
         "auth_enabled": False,
     }
@@ -39,13 +78,13 @@ def _base_settings(tmp_path, **overrides) -> Settings:
 
 
 @pytest.fixture
-def settings(tmp_path) -> Settings:
-    return _base_settings(tmp_path)
+def settings(tmp_path, pg_url) -> Settings:
+    return _base_settings(tmp_path, pg_url)
 
 
 @pytest.fixture
-def auth_settings(tmp_path) -> Settings:
-    return _base_settings(tmp_path, auth_enabled=True)
+def auth_settings(tmp_path, pg_url) -> Settings:
+    return _base_settings(tmp_path, pg_url, auth_enabled=True)
 
 
 @pytest.fixture
