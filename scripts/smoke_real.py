@@ -175,19 +175,30 @@ async def main() -> None:
                 f";总花费 ≈ {(usage1['total_tokens'] + (usage2 or usage1)['total_tokens']) * 0.0000008:.6f} 元量级(qwen-turbo)"
             )
 
-        # 账本落库验证
-        await app.state.task_queue.flush()
+        # 账本落库验证:轮询等齐 2 行(非流式+流式)——记账在响应结束后的 BackgroundTask
+        # 里 enqueue,单次 flush 只保证"队列清空",不保证后台任务已入队,会抢跑;
+        # 抢跑后硬停机会把在途 commit 连同账本行一起取消(2026-11-03 实测 1/2 行)。
         from sqlalchemy import func, select
 
         from app.db.models import UsageRecord
 
-        async with build_session_factory(app.state.engine)() as db:
-            n, tokens = (
-                await db.execute(
-                    select(func.count(UsageRecord.id), func.coalesce(func.sum(UsageRecord.total_tokens), 0))
-                )
-            ).one()
+        n, tokens = 0, 0
+        for _ in range(50):  # 最多 ~5s
+            async with build_session_factory(app.state.engine)() as db:
+                n, tokens = (
+                    await db.execute(
+                        select(func.count(UsageRecord.id), func.coalesce(func.sum(UsageRecord.total_tokens), 0))
+                    )
+                ).one()
+            if n >= 2:
+                break
+            await asyncio.sleep(0.1)
+        await app.state.task_queue.flush()
         results.append(f"- 账本对账:{n} 行,总 token {tokens}(= 网关异步记账落库成功)")
+        results.append(
+            "- 边界注记:记账 at-least-once 从 enqueue 起算;进程硬停可丢在途 BackgroundTask 账本行"
+            "(升级路径=接入层 write-ahead),本脚本以优雅停机+轮询规避"
+        )
 
         report = "\n".join(results)
         print(report)
