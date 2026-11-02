@@ -6,7 +6,7 @@
 
 ## ① 测试证据
 
-- **55/55 全绿(SQLite 方言)+ 55/55 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,生产审计批次后)
+- **57/57 全绿(SQLite 方言)+ 57/57 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,含 OTel 批次)
   - 命令:`.venv/Scripts/python -m pytest tests -q`;PG 口径:`AGENTGATE_TEST_PG=1` 同命令
   - 组成:M0 协议代理 13 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · M4 渠道注册 1 · M5 缓存 5 · 语义 5 · MCP 1 · M6 持久化/双副本 3 · 观测/杂项 4
   - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
@@ -95,6 +95,7 @@
 | 2 | channels 表建了路由不读,重启丢运行时注册渠道(成分缺口) | ADR-005:admin 双写(运行时+入库)+ 启动 load_channels_from_db 恢复 | test_channel_registry_survives_restart |
 | 3 | "多副本不放大"主张无直接测试(主张无测试) | 双副本一致性测试:两 app 共享 Redis 合并并发 100×容量 50→恰放行 50+回补(±2 容差,令牌桶惰性回补语义) | test_two_replica_rate_limit_no_amplification |
 | 4 | 无就绪检查(k8s 成分缺口) | /ready:Redis ping + DB select + 队列积压读数 | test_ready_endpoint |
+| 5 | 无分布式追踪(JD 成分缺口:Kimi 全系明写 OpenTelemetry) | OTel 手动 span(每次上游尝试,属性 channel/model/status),console/OTLP 导出,默认关零开销;InMemory exporter 测试断言 | test_m6_tracing |
 
 - PG 口径暴露的差异(诚实记录):PG 强制外键(cache_first 测试需先清账本行)/ PG 鉴权稍慢令牌桶回补 +1(断言容量+回补容差)/ MCP+asyncpg 的 loop 绑定(Event loop is closed→持久 loop)。
 
