@@ -14,6 +14,7 @@
 | 4 | **at-least-once + 幂等 = 效果 exactly-once**:Streams consumer group/XACK/XCLAIM 崩溃恢复/死信,幂等键 UNIQUE 兜底 | Dify 用 Celery 是黑盒,ADR-003 自研才讲得透 | `test_m2_streams` |
 | 5 | **故障转移状态机**:429 立即冷却+尊重 Retry-After;5xx 冷却 60s;EMA 延迟优先路由;全渠道冷却 → 503(带 Retry-After) | LiteLLM routing/reliability | `test_m2_failover` |
 | 6 | **流式 fallback 的语义难题**:chunk 已发出不可回滚 → mid-stream 错误以 SSE error 事件如实透传 | LiteLLM reliability 文档记录的同款 caveat | `test_stream_*` |
+| 7 | **账本走自研持久队列**(自吃狗粮):at-least-once + 幂等键,网关崩溃在途账本不丢;渠道注册表持久化,重启不丢 | ADR-004/005;自研队列从演示件变核心通道 | `test_m6_persistence` |
 
 ## 验收数字(EVIDENCE.md 有完整口径)
 
@@ -21,7 +22,8 @@
 - **多进程水平扩展 1.00x → 2.15x → 4.04x**(workers 1/2/4,共享状态全在 Redis)
 - **并发 100 限流扣减恰好放行 50**(容量 50,硬上界零超卖)
 - **并发 100 记账恰好 1800 token**(原子 INCRBY 零丢失)、账本 100 行对账一致
-- **双数据库口径 47+47 全绿**(SQLite + PostgreSQL 16.2 真库,Alembic 迁移真 PG 验证)
+- **双数据库口径 55+55 全绿**(SQLite + PostgreSQL 16.2 真库,Alembic 迁移真 PG 验证)
+- **双副本限流一致性实测**:两副本共享 Redis,合并并发 100 × 容量 50 → 恰放行 50(不放大)
 - **真实 PolicyCompass 已接入**:OpenAI 请求穿网关→shim→PC CRAG 答题(937ms/710 字),自家网关管自家 Agent
 
 ![管理台](docs/screenshots/admin_web.png)
@@ -92,7 +94,7 @@ app/
   mcp_server.py   MCP stdio 工具面(渠道健康/用量/预算/签发 key,与网关共享状态)
   web/        管理台单文件页(/admin/web)
   db/         SQLAlchemy 2.0 方言中立模型 + Alembic
-docs/adr/     ADR-001 语言选型 · ADR-002 存储策略(双口径) · ADR-003 Streams vs Celery
+docs/adr/     ADR-001 语言选型 · ADR-002 存储策略(双口径) · ADR-003 Streams vs Celery · ADR-004 记账走持久队列 · ADR-005 渠道持久化
 docs/PROJECT_BOOK.md  面试深挖手册(10 问三段式 + 诚实边界 + 演示剧本)
 tests/        47 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/双数据库)
 scripts/      load_test(附加开销口径)· load_workers(扩展曲线)· demo_admin · demo_ecosystem · demo_pc_gateway · smoke_real · verify_pg_migration · agent_shim_example

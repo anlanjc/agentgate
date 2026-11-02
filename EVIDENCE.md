@@ -6,9 +6,9 @@
 
 ## ① 测试证据
 
-- **47/47 全绿(SQLite 方言)+ 47/47 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-02)
+- **55/55 全绿(SQLite 方言)+ 55/55 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,生产审计批次后)
   - 命令:`.venv/Scripts/python -m pytest tests -q`;PG 口径:`AGENTGATE_TEST_PG=1` 同命令
-  - 组成:M0 协议代理 12 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · M4 渠道注册 1 · M5 缓存 5 · MCP 1 · 观测/杂项 5
+  - 组成:M0 协议代理 13 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · M4 渠道注册 1 · M5 缓存 5 · 语义 5 · MCP 1 · M6 持久化/双副本 3 · 观测/杂项 4
   - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
   - 故障注入面:进程内 mock 上游(429/500/慢/断流)+ 真实 TCP(装死→读超时、discard→拒连、abort→RST 重置)+ 关 Redis(路由降级)
 - **Alembic 迁移在真 PostgreSQL 验证通过**:`scripts/verify_pg_migration.py`(evidence/pg_migration.txt)——upgrade head + 5 表齐全;幂等可重跑
@@ -86,6 +86,17 @@
   (agent venv 无 langgraph/jieba);③首版演示 bootstrap 假渠道按字母序抢走流量(EMA 同为默认值)
   → 砍假渠道让 PC 即默认渠道;④PC 无 token 计量,shim 上报 usage=0,账本 token=0 是诚实记录。
 - pgserver 运维坑:被强杀后残留 postmaster.pid/进程锁 → taskkill postgres + 删 .pgdata 重建(测试库无状态)。
+
+## ⑤++ 生产审计批次(2026-11-03,第八批)——审计出 4 项全修
+
+| # | 审计发现 | 修复 | 证据 |
+|---|---|---|---|
+| 1 | 账本走进程内单写者,崩溃丢在途账本(设计降级点:Streams 建了没用在核心通道) | ADR-004:记账 enqueue("usage_write",幂等键 usage:{request_id})走 Streams;UsageWriter 退役 | test_m6 + 55×2 全绿 |
+| 2 | channels 表建了路由不读,重启丢运行时注册渠道(成分缺口) | ADR-005:admin 双写(运行时+入库)+ 启动 load_channels_from_db 恢复 | test_channel_registry_survives_restart |
+| 3 | "多副本不放大"主张无直接测试(主张无测试) | 双副本一致性测试:两 app 共享 Redis 合并并发 100×容量 50→恰放行 50+回补(±2 容差,令牌桶惰性回补语义) | test_two_replica_rate_limit_no_amplification |
+| 4 | 无就绪检查(k8s 成分缺口) | /ready:Redis ping + DB select + 队列积压读数 | test_ready_endpoint |
+
+- PG 口径暴露的差异(诚实记录):PG 强制外键(cache_first 测试需先清账本行)/ PG 鉴权稍慢令牌桶回补 +1(断言容量+回补容差)/ MCP+asyncpg 的 loop 绑定(Event loop is closed→持久 loop)。
 
 ## ⑥ 面试素材索引
 
