@@ -13,7 +13,9 @@
     <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M12 2L3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7l-9-5z"/><path d="M8 12h8M8 9v6M16 9v6" stroke-opacity=".55"/></svg></div>
     <h1>agentgate <span>管理台</span></h1>
     <span class="badge" id="ver"></span>
-    <span class="badge" style="margin-left:auto"><a href="/playground" style="color:var(--acc);text-decoration:none">→ Playground</a></span>
+    <input id="adminToken" type="password" placeholder="X-Admin-Token(生产必填)" autocomplete="off"
+           style="margin-left:auto;width:210px" title="仅存 sessionStorage,不写 cookie">
+    <span class="badge"><a href="/playground" style="color:var(--acc);text-decoration:none">→ Playground</a></span>
   </div>
   <div class="sub"><span class="dot"></span>多租户 LLM/Agent 网关 · 渠道健康 / 租户与 key / 用量对账</div>
 
@@ -64,15 +66,32 @@
 <script>
 const $ = s => document.querySelector(s);
 const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; setTimeout(()=>t.style.display='none',2500); };
-const api = (p, opt) => fetch('/admin'+p, opt).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error?.message || r.status); return j; });
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const adminToken = () => sessionStorage.getItem('ag_admin_token') || '';
+$('#adminToken').value = adminToken();
+$('#adminToken').addEventListener('input', e => sessionStorage.setItem('ag_admin_token', e.target.value.trim()));
+const api = (p, opt = {}) => {
+  opt.headers = {...(opt.headers || {})};
+  const token = adminToken();
+  if (token) opt.headers['X-Admin-Token'] = token;
+  return fetch('/admin'+p, opt).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = r.status === 401 ? '需要有效的 X-Admin-Token' : (j.error?.message || r.status);
+      toast(msg);
+      throw new Error(msg);
+    }
+    return j;
+  });
+};
 
 async function loadChannels(){
   const {channels} = await api('/channels');
   $('#ch tbody').innerHTML = channels.map(c => `<tr>
-    <td><b>${c.name}</b><div class="muted">${(c.models||[]).join(', ')||'—'}</div></td>
-    <td>${c.ema_ms} ms</td>
+    <td><b>${esc(c.name)}</b><div class="muted">${esc((c.models||[]).join(', ')||'—')}</div></td>
+    <td>${esc(c.ema_ms)} ms</td>
     <td>${c.cooling ? '<span class="pill cool">冷却中</span>' : '<span class="pill ok">健康</span>'}</td>
-    <td>${c.fail_streak}</td></tr>`).join('');
+    <td>${esc(c.fail_streak)}</td></tr>`).join('');
 }
 async function registerChannel(){
   const models = $('#chModels').value.split(',').map(s=>s.trim()).filter(Boolean);
@@ -83,10 +102,10 @@ async function registerChannel(){
 async function loadTenants(){
   const {tenants} = await api('/tenants');
   $('#tn tbody').innerHTML = tenants.map(t => `<tr>
-    <td class="muted">${t.id.slice(0,8)}…</td><td>${t.name}</td>
+    <td class="muted">${esc(t.id.slice(0,8))}…</td><td>${esc(t.name)}</td>
     <td class="muted">${t.webhook_url ? '已配置' : '—'}</td>
-    <td><button class="ghost" onclick="pickTenant('${t.id}')">选入签发/对账</button></td></tr>`).join('');
-  const opts = tenants.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
+    <td><button class="ghost" onclick="pickTenant('${esc(t.id)}')">选入签发/对账</button></td></tr>`).join('');
+  const opts = tenants.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
   $('#kTenant').innerHTML = opts; $('#uTenant').innerHTML = opts;
 }
 function pickTenant(id){ $('#kTenant').value = id; $('#uTenant').value = id; loadUsage(); loadKeyList(); }
@@ -95,8 +114,8 @@ async function loadKeyList(){
   try {
     const {keys} = await api(`/tenants/${tid}/keys`);
     $('#klist tbody').innerHTML = keys.map(k => `<tr>
-      <td class="muted">${k.prefix}…</td><td>${k.name||'—'}</td>
-      <td class="muted">${k.rpm_limit}/min</td>
+      <td class="muted">${esc(k.prefix)}…</td><td>${esc(k.name||'—')}</td>
+      <td class="muted">${esc(k.rpm_limit)}/min</td>
       <td>${k.is_active ? '<span class="pill ok">有效</span>' : '<span class="pill cool">已吊销</span>'}</td>
       <td>${k.is_active ? `<button class="ghost" onclick="revokeKey('${k.key_id}')">吊销</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">无</td></tr>';
   } catch(e) { /* 租户刚创建时无 key,静默 */ }
@@ -118,8 +137,8 @@ async function issueKey(){
 async function loadUsage(){
   const tid = $('#uTenant').value; if (!tid) return;
   const u = await api(`/tenants/${tid}/usage`);
-  $('#usage tbody').innerHTML = `<tr><td>${u.requests}</td><td>${u.total_tokens}</td>
-    <td class="muted">${Object.entries(u.by_model).map(([m,v])=>`${m}×${v.requests}`).join(' · ')||'—'}</td></tr>`;
+  $('#usage tbody').innerHTML = `<tr><td>${esc(u.requests)}</td><td>${esc(u.total_tokens)}</td>
+    <td class="muted">${Object.entries(u.by_model).map(([m,v])=>`${esc(m)}×${esc(v.requests)}`).join(' · ')||'—'}</td></tr>`;
 }
 async function purgeCache(){
   const {purged} = await api('/cache', {method:'DELETE'});

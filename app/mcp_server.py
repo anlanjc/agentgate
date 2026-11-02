@@ -56,13 +56,26 @@ def _services():
 def gateway_channels() -> str:
     import time
 
+    from sqlalchemy import select
+
+    from app.db.models import Channel
     from app.router.failover import _state_key
 
     settings = get_settings()
-    names = settings.models  # 渠道名单以配置为准的演示口径;运行态注册渠道见 admin API
 
     async def run():
-        redis, _ = _services()
+        redis, session_factory = _services()
+        names = [settings.upstream_name]
+        # 运行态注册的渠道从 channels 表读 —— 与 admin API 同一事实来源,
+        # 不能拿 settings.models(模型名)冒充渠道名。
+        async with session_factory() as db:
+            rows = (
+                await db.execute(select(Channel.name).where(Channel.is_active))
+            ).scalars().all()
+        for name in rows:
+            if name not in names:
+                names.append(name)
+
         now_ms = int(time.time() * 1000)
         out = []
         for name in names:
@@ -136,13 +149,20 @@ def gateway_issue_key(
 ) -> str:
     import uuid
 
+    from sqlalchemy import select
+
     from app.auth.keys import generate_key
-    from app.db.models import VirtualKey
+    from app.db.models import Tenant, VirtualKey
 
     async def run():
         _, session_factory = _services()
         raw, key_hash, prefix = generate_key()
         async with session_factory() as db:
+            exists = (
+                await db.execute(select(Tenant.id).where(Tenant.id == tenant_id))
+            ).scalar_one_or_none()
+            if exists is None:
+                return {"error": "tenant_not_found", "tenant_id": tenant_id}
             vk = VirtualKey(
                 id=uuid.uuid4().hex[:32],
                 tenant_id=tenant_id,

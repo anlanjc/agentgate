@@ -41,6 +41,8 @@ async def load_channels_from_db(app_: FastAPI) -> int:
             continue
         client = UpstreamClient(
             ch.base_url, ch.api_key,
+            connect_timeout=ch.connect_timeout,
+            read_timeout=ch.read_timeout,
             trust_env=settings.llm_trust_env,
         )
         router.register(ch.name, client, ch.models)
@@ -65,8 +67,14 @@ def create_app(
         logger.info("app_started", version=__version__, upstream=settings.upstream_name)
         # 生产启动:从 channels 表恢复渠道注册(运行时注册的重启不丢)
         await load_channels_from_db(app_)
+        # 启动 outbox sweeper/消费者;Redis 暂时不可用时由首次 enqueue 惰性重试。
+        try:
+            await app_.state.task_queue.start()
+        except Exception as exc:
+            logger.warning("task_queue_start_deferred", error=str(exc))
         yield
         await app_.state.task_queue.stop()
+        await app_.state.channel_router.aclose()
         await app_.state.redis.aclose()
         await app_.state.engine.dispose()
         logger.info("app_stopped")
@@ -108,6 +116,8 @@ def create_app(
         else:
             from app.cache.semantic import HashEmbedder
 
+            # 明确告警:HashEmbedder 是词面 bigram,不是真语义;禁止把它当生产口径。
+            logger.warning("semantic_cache_uses_lexical_hash_embedder_dev_only")
             app_.state.embedder = HashEmbedder()
 
     # M2:渠道注册表(默认渠道 = settings 指向的上游)+ 任务队列(webhook 回调 + 账本落库,自吃狗粮)

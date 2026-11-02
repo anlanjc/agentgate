@@ -64,8 +64,19 @@ jobs:
           cache: pip
       - name: Install deps
         run: pip install -r requirements.txt
+      - name: Alembic migration on real PostgreSQL
+        env:
+          AGENTGATE_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+        run: alembic upgrade head
       - name: Test(PostgreSQL 16 方言 —— 双口径 CI 强制)
         env:
           AGENTGATE_TEST_PG: "1"
           AGENTGATE_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: pytest tests -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production image
+        run: docker build -t agentgate:ci .

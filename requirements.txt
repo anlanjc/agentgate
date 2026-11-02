@@ -16,11 +16,20 @@ redis>=5.0
 fakeredis>=2.23
 lupa>=2.0
 
-# 观测
+# 观测(M6:OTel 默认关,但依赖必须声明 —— 否则干净环境 CI 会在 import 时失败)
 structlog>=24.0
 prometheus-client>=0.20
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-grpc>=1.27
 
-# dev
+# MCP stdio server(2026 Agent 工具面)
+mcp>=2.0
+
+# 压测脚本(C 解析器客户端;aiohttp 不是网关运行时依赖)
+aiohttp>=3.9
+
+# dev / local PG 口径(CI 用 postgres service,不需要 pgserver)
 pytest>=8.2
 pytest-asyncio>=0.23
 ruff>=0.5
+pgserver>=0.1.4

@@ -5,14 +5,17 @@
 services:
   gateway:
     build: ..
+    restart: unless-stopped
     ports:
       - "8100:8100"
     environment:
+      AGENTGATE_ENVIRONMENT: prod
       AGENTGATE_DB_URL: postgresql+asyncpg://agentgate:agentgate@postgres:5432/agentgate
       AGENTGATE_REDIS_URL: redis://redis:6379/0
       AGENTGATE_UPSTREAM_BASE_URL: ${AGENTGATE_UPSTREAM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       AGENTGATE_UPSTREAM_API_KEY: ${AGENTGATE_UPSTREAM_API_KEY:-}
-      AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:-change-me}
+      # 不提供默认值:未设置时 compose 直接报错,杜绝 change-me 上公网。
+      AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:?set a strong AGENTGATE_ADMIN_TOKEN first}
       AGENTGATE_LLM_TRUST_ENV: "false"
     depends_on:
       postgres:

@@ -56,6 +56,9 @@ class ChannelRouter:
     def names(self) -> list[str]:
         return list(self._clients)
 
+    def models_of(self, name: str) -> list:
+        return list(self._models.get(name) or [])
+
     async def _state(self, name: str) -> dict:
         try:
             raw = await self._redis.hgetall(_state_key(name))
@@ -68,19 +71,32 @@ class ChannelRouter:
             "fail_streak": int(raw.get("fail_streak", 0)),
         }
 
-    async def candidates(self) -> list[str]:
-        """健康渠道按 EMA 升序(延迟优先路由);状态读取走 pipeline(单往返)。"""
+    def supports(self, name: str, model: str | None) -> bool:
+        """渠道的 models 为空 = 兼容全部;否则必须显式声明该模型。
+
+        这是路由正确性边界:注册时声明了 models 的渠道,不能被无关模型请求命中。
+        """
+        if not model:
+            return True
+        supported = self._models.get(name) or []
+        return not supported or model in supported
+
+    async def candidates(self, model: str | None = None) -> list[str]:
+        """健康且支持该模型的渠道,按 EMA 升序(延迟优先路由);状态读取走 pipeline。"""
+        names = [n for n in self._clients if self.supports(n, model)]
+        if not names:
+            return []
         now_ms = int(time.time() * 1000)
         try:
             pipe = self._redis.pipeline(transaction=False)
-            for name in self._clients:
+            for name in names:
                 pipe.hgetall(_state_key(name))
             states = await pipe.execute()
         except Exception as e:  # Redis 不可用:降级为无状态
             logger.warning("router_state_degraded", error=str(e))
-            return list(self._clients)
+            return names
         healthy: list[tuple[float, str]] = []
-        for name, raw in zip(self._clients, states):
+        for name, raw in zip(names, states):
             cooldown_until_ms = int(raw.get("cooldown_until_ms", 0) or 0)
             if cooldown_until_ms > now_ms:
                 continue
@@ -93,10 +109,12 @@ class ChannelRouter:
             await eval_cached(self._redis, EMA_SUCCESS_LUA, 1, _state_key(name), latency_ms)
         except Exception as e:
             logger.warning("router_mark_degraded", channel=name, error=str(e))
+        self._set_cooling_metric(name, False)
 
     async def mark_rate_limited(self, name: str, retry_after_s: int) -> None:
         until = int(time.time() * 1000) + max(1, retry_after_s) * 1000
         await self._safe_hset(name, {"cooldown_until_ms": until})
+        self._set_cooling_metric(name, True)
         logger.warning("channel_cooling_429", channel=name, retry_after_s=retry_after_s)
 
     async def mark_failure(self, name: str) -> None:
@@ -106,6 +124,7 @@ class ChannelRouter:
         await self._safe_hset(
             name, {"fail_streak": streak, "cooldown_until_ms": until}
         )
+        self._set_cooling_metric(name, True)
         logger.warning("channel_cooling_failure", channel=name, fail_streak=streak)
 
     async def _safe_hset(self, name: str, mapping: dict) -> None:
@@ -114,5 +133,29 @@ class ChannelRouter:
         except Exception as e:
             logger.warning("router_mark_degraded", channel=name, error=str(e))
 
+    @staticmethod
+    def _set_cooling_metric(name: str, cooling: bool) -> None:
+        """渠道状态变化时更新 gauge(不在每请求读 Redis 再写指标,避免热路径开销)。"""
+        try:
+            from app.observability import metrics
+
+            metrics.CHANNEL_COOLING.labels(channel=name).set(1 if cooling else 0)
+        except Exception as exc:
+            logger.warning("channel_metric_failed", channel=name, error=str(exc))
+
     async def state_of(self, name: str) -> dict:
         return await self._state(name)
+
+    async def aclose(self) -> None:
+        """关闭所有上游连接池(优雅停机;重复 aclose 安全)。"""
+        seen: set[int] = set()
+        for client in self._clients.values():
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception as exc:
+                    logger.warning("channel_close_failed", error=str(exc))

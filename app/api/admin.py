@@ -4,11 +4,14 @@
 raw key 只在签发响应中出现一次,服务端只存哈希(泄露库≠泄露可用 key)。
 """
 
+import secrets
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.auth.keys import generate_key, invalidate
 from app.db.models import Tenant, UsageRecord, VirtualKey
@@ -19,20 +22,32 @@ router = APIRouter(prefix="/admin")
 
 def _require_admin(request: Request) -> None:
     token = request.app.state.settings.admin_token
-    if token and request.headers.get("x-admin-token") != token:
+    supplied = request.headers.get("x-admin-token", "")
+    # 常量时间比较:避免 token 前缀逐字节探测。
+    if token and not secrets.compare_digest(supplied, token):
         raise GatewayError(401, "admin token invalid", "authentication_error", "admin_unauthorized")
 
 
+def _parse_dt(value: str | None, field: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        raise GatewayError(400, f"invalid {field} timestamp", "invalid_request_error", "invalid_timestamp")
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
 class TenantCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=128)
     webhook_url: str | None = None
 
 
 class KeyCreate(BaseModel):
     name: str = ""
-    rpm_limit: int = 60
-    tpm_limit: int = 100_000
-    budget_tokens: int | None = None
+    rpm_limit: int = Field(default=60, ge=1)
+    tpm_limit: int = Field(default=100_000, ge=1)
+    budget_tokens: int | None = Field(default=None, ge=0)
     model_whitelist: list[str] | None = None
 
 
@@ -42,7 +57,13 @@ async def create_tenant(body: TenantCreate, request: Request) -> dict:
     async with request.app.state.session_factory() as db:
         tenant = Tenant(id=uuid.uuid4().hex[:32], name=body.name, webhook_url=body.webhook_url)
         db.add(tenant)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise GatewayError(
+                409, "tenant name already exists", "invalid_request_error", "tenant_exists"
+            )
         return {"id": tenant.id, "name": tenant.name, "webhook_url": tenant.webhook_url}
 
 
@@ -85,14 +106,35 @@ async def deactivate_key(key_id: str, request: Request) -> dict:
 
 
 @router.get("/tenants/{tenant_id}/usage")
-async def tenant_usage(tenant_id: str, request: Request) -> dict:
+async def tenant_usage(
+    tenant_id: str,
+    request: Request,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict:
+    """租户用量对账;start/end 为 ISO-8601,左闭右开。
+
+    生产账单不会扫全表:默认时间窗由调用方给,底层走 (tenant_id, created_at)
+    复合索引。全量聚合仍可用(不传参数),但大租户应改用日汇总表。
+    """
     _require_admin(request)
+    start_dt = _parse_dt(start, "start")
+    end_dt = _parse_dt(end, "end")
+    if start_dt and end_dt and start_dt >= end_dt:
+        raise GatewayError(400, "start must be before end", "invalid_request_error", "invalid_time_range")
+
+    filters = [UsageRecord.tenant_id == tenant_id]
+    if start_dt:
+        filters.append(UsageRecord.created_at >= start_dt)
+    if end_dt:
+        filters.append(UsageRecord.created_at < end_dt)
+
     async with request.app.state.session_factory() as db:
         total = await db.execute(
             select(
                 func.count(UsageRecord.id),
                 func.coalesce(func.sum(UsageRecord.total_tokens), 0),
-            ).where(UsageRecord.tenant_id == tenant_id)
+            ).where(*filters)
         )
         requests_n, tokens_n = total.one()
         by_model = await db.execute(
@@ -101,11 +143,13 @@ async def tenant_usage(tenant_id: str, request: Request) -> dict:
                 func.count(UsageRecord.id),
                 func.coalesce(func.sum(UsageRecord.total_tokens), 0),
             )
-            .where(UsageRecord.tenant_id == tenant_id)
+            .where(*filters)
             .group_by(UsageRecord.model)
         )
         return {
             "tenant_id": tenant_id,
+            "start": start_dt.isoformat() if start_dt else None,
+            "end": end_dt.isoformat() if end_dt else None,
             "requests": int(requests_n),
             "total_tokens": int(tokens_n),
             "by_model": {m: {"requests": int(c), "total_tokens": int(t)} for m, c, t in by_model.all()},
@@ -151,26 +195,38 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     )
     router.register(body.name, client, body.models)
 
-    # 持久化(ADR-005):重启恢复
+    # 持久化(ADR-005):重启恢复;超时参数也必须入库,否则重启后静默回默认值。
     async with request.app.state.session_factory() as db:
         from sqlalchemy import select
 
         row = await db.execute(select(Channel).where(Channel.name == body.name))
         ch = row.scalar_one_or_none()
-        if ch is None:
-            db.add(
-                Channel(
-                    id=_uuid.uuid4().hex[:32], name=body.name, base_url=body.base_url,
-                    api_key=body.api_key, models=body.models,
+        try:
+            if ch is None:
+                db.add(
+                    Channel(
+                        id=_uuid.uuid4().hex[:32], name=body.name, base_url=body.base_url,
+                        api_key=body.api_key, models=body.models,
+                        connect_timeout=body.connect_timeout, read_timeout=body.read_timeout,
+                    )
                 )
-            )
+            else:
+                ch.base_url, ch.api_key, ch.models, ch.is_active = (
+                    body.base_url, body.api_key, body.models, True,
+                )
+                ch.connect_timeout, ch.read_timeout = body.connect_timeout, body.read_timeout
             await db.commit()
-        else:
-            ch.base_url, ch.api_key, ch.models, ch.is_active = (
-                body.base_url, body.api_key, body.models, True,
-            )
-            await db.commit()
-    return {"channel": body.name, "models": body.models, "registered": True, "persisted": True}
+        except IntegrityError:
+            await db.rollback()
+            raise GatewayError(409, "channel already persisted", "invalid_request_error", "channel_exists")
+    return {
+        "channel": body.name,
+        "models": body.models,
+        "connect_timeout": body.connect_timeout,
+        "read_timeout": body.read_timeout,
+        "registered": True,
+        "persisted": True,
+    }
 
 
 @router.delete("/cache")
@@ -187,6 +243,7 @@ async def purge_response_cache(request: Request) -> dict:
 @router.get("/channels")
 async def list_channels(request: Request) -> dict:
     """渠道注册表 + 运行态健康(EMA/冷却/连续失败)—— 管理界面与排障第一屏。"""
+    _require_admin(request)
     import time
 
     from app.router.failover import _state_key
@@ -199,7 +256,7 @@ async def list_channels(request: Request) -> dict:
         out.append(
             {
                 "name": name,
-                "models": router._models.get(name, []),
+                "models": router.models_of(name),
                 "ema_ms": round(float(raw.get("ema_ms", 1000) or 1000), 1),
                 "cooling": int(raw.get("cooldown_until_ms", 0) or 0) > now_ms,
                 "fail_streak": int(raw.get("fail_streak", 0) or 0),
