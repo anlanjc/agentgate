@@ -37,3 +37,10 @@
 ## 已完成明细(追加区)
 
 - [AG-1 2026-11-01] 立项:环境侦察(无 Docker/PG/Redis,网络三条路实测)+ 本文件 + ADR-001/002/003 + ARCHITECTURE.md。便携 Redis 下载中、依赖经阿里镜像安装中。
+- [AG-2 2026-11-03] hardening 批次审阅与锁存(ds-update 轮 27 文件由 AG-2 复核后分 5 笔入库):
+  ①test: PG 口径 schema 漂移防护(.pgdata 持久库旧 schema 残留致 14 假失败,会话开始 drop_all+create_all 重建;迁移验证职责分离)→ **AGENTGATE_TEST_PG=1 修复前 14 failed → 修复后 62 passed**;
+  ②feat: 请求路径 hardening(流式指标挪 relay finally·TTFT 起点=进网关·499/502 语义·强制 include_usage·账本 (tenant_id,request_id) UNIQUE+租户域幂等键·显式 temperature 门控·context_digest·预算+TPM 单 Lua·prod fail-closed·迁移 7c1f4a9b2d10);
+  ③feat: 队列 hardening(outbox 水位补投·条件 UPDATE 原子抢占·visibility 500ms→30s·XACK 后 XDEL 真实 backlog);
+  ④feat: 管理面安全(admin 常量时间 token·渠道超时持久化·路由 model 过滤·MCP 渠道同源·管理台 XSS 转义·Dockerfile 非 root+healthcheck·compose 禁默认 token·CI 加 PG 迁移+Docker build);
+  ⑤docs: 证据与审阅记录入册(ds-update.md/ROADMAP.md/pg_migration.txt 含 7c1f4a9b2d10 产物验证+幂等重跑)。
+  终态:**62 passed(SQLite)+ 62 passed(PG 16.2)+ ruff 全绿 + 迁移真 PG 验证**;遗留见 ROADMAP.md(P0-B 文档口径统一/Grafana 面板、P0-C outbox 注入测试/Redis 挂 fail-closed、P1 压测重跑)。

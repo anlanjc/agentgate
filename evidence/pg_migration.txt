@@ -5,3 +5,11 @@ INFO  [alembic.runtime.migration] Running upgrade  -> 3215fe6889f5, init schema
 [2] alembic upgrade head 完成
 [3] PG 表验证通过: ['channels', 'task_records', 'tenants', 'usage_records', 'virtual_keys']
 ✅ 迁移在真 PostgreSQL 上验证通过
+
+# 2026-11-03 AG-2 复验(含 7c1f4a9b2d10 hardening 迁移)
+[1] PostgreSQL 16.2 on x86_64-pc-mingw64 @ 127.0.0.1:62133/postgres
+[2] alembic upgrade head 完成
+[3] PG 表验证通过: ['channels', 'task_records', 'tenants', 'usage_records', 'virtual_keys']
+[4] 7c1f4a9b2d10 迁移产物验证通过:published_at/超时列/key_id 可空/唯一约束
+[5] alembic upgrade head 幂等重跑通过
+✅ 迁移在真 PostgreSQL 上验证通过(含 hardening 迁移)
