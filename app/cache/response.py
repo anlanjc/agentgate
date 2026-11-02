@@ -65,3 +65,48 @@ async def put(redis, key: str, body: dict, ttl: int) -> None:
         await redis.set(key, json.dumps(body, ensure_ascii=False), ex=ttl)
     except RedisError as exc:
         logger.warning("response_cache_write_degraded", error=str(exc))
+
+
+# ---------- 单飞锁(P2 hardening):同 prompt 并发 miss 只放一个去上游 ----------
+
+LOCK_TTL_MS = 3000
+POLL_INTERVAL_S = 0.05
+POLL_BUDGET_S = 1.0
+
+
+def _lock_key(key: str) -> str:
+    return f"{key}:lock"
+
+
+async def try_acquire(redis, key: str) -> bool:
+    """SETNX 占锁(3s 自愈);持锁者负责去上游并填缓存。"""
+    try:
+        return bool(await redis.set(_lock_key(key), "1", nx=True, px=LOCK_TTL_MS))
+    except RedisError as exc:
+        logger.warning("singleflight_acquire_degraded", error=str(exc))
+        return True  # 降级:无锁执行(与无单飞行为一致)
+
+
+async def release(redis, key: str) -> None:
+    try:
+        await redis.delete(_lock_key(key))
+    except RedisError as exc:
+        logger.warning("singleflight_release_degraded", error=str(exc))
+
+
+async def wait_for_fill(redis, key: str, budget_s: float = POLL_BUDGET_S) -> dict | None:
+    """短轮询等持锁者填缓存;预算(1s)耗尽则返回 None,调用方自行去上游。
+
+    设计取舍:不无限等待(上游挂了持锁者填不出,等待方不该陪葬),也不在网关层
+    挂起合并请求(需要 per-key futures,复杂度不匹配当前规模;诚实边界)。
+    """
+    import asyncio
+    import time as _time
+
+    deadline = _time.monotonic() + budget_s
+    while _time.monotonic() < deadline:
+        cached = await get(redis, key)
+        if cached is not None:
+            return cached
+        await asyncio.sleep(POLL_INTERVAL_S)
+    return None

@@ -47,6 +47,8 @@ class AuthResult:
     # 有最长 60s 的生效延迟 —— 预算是计量控制非安全边界,该窗口可接受(admin
     # 设置预算时主动重建计数器,limit 读数偏差以账本对账为准)。
     tenant_budget_tokens: int | None = None
+    # 每 key 并发上限(NULL=不限);同样随缓存有 60s 变更窗口(保护闸非计费)
+    concurrency_limit: int | None = None
 
 
 class KeyNotFound(Exception):
@@ -74,6 +76,7 @@ def _serialize(vk: VirtualKey, tenant_budget_tokens: int | None) -> str:
             "budget_tokens": vk.budget_tokens,
             "is_active": vk.is_active,
             "tenant_budget_tokens": tenant_budget_tokens,
+            "concurrency_limit": vk.concurrency_limit,
         }
     )
 
@@ -106,6 +109,7 @@ async def lookup(
             budget_tokens=data["budget_tokens"],
             cache_hit=True,
             tenant_budget_tokens=data.get("tenant_budget_tokens"),
+            concurrency_limit=data.get("concurrency_limit"),
         )
 
     async with session_factory() as db:
@@ -137,6 +141,7 @@ async def lookup(
         budget_tokens=vk.budget_tokens,
         cache_hit=False,
         tenant_budget_tokens=tenant_budget,
+        concurrency_limit=vk.concurrency_limit,
     )
 
 

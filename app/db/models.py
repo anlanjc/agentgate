@@ -55,6 +55,8 @@ class VirtualKey(Base):
     tpm_limit: Mapped[int] = mapped_column(Integer, default=100_000)
     budget_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # None=不限
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 每 key 并发上限(NULL=不限):RPM/TPM 之外的第三道闸,保护上游与网关在途资源
+    concurrency_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

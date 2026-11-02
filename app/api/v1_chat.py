@@ -27,7 +27,7 @@ from app.errors import GatewayError
 from app.log import current_request_id, get_logger
 from app.observability import metrics
 from app.quota import service as quota_service
-from app.ratelimit.admit import admit
+from app.ratelimit.admit import AdmitResult, admit
 from app.router.failover import ChannelRouter
 from app.schemas.openai import ChatCompletionRequest, GatewayErrorBody
 from app.upstream.client import READ_ERRORS, UPSTREAM_TRANSPORT_ERRORS
@@ -218,11 +218,13 @@ async def _authenticate(request: Request, raw_key: str) -> AuthResult:
         raise GatewayError(401, "api key revoked", "authentication_error", "key_inactive")
 
 
-async def _admit(request: Request, auth: AuthResult, model: str) -> None:
-    """准入三关(单次 Lua 往返):模型白名单 → RPM 令牌桶(硬上界)→ TPM 窗口/预算预检(计量制)。
+async def _admit(request: Request, auth: AuthResult, model: str) -> AdmitResult:
+    """准入链(单次 Lua 往返):模型白名单 → RPM 令牌桶(硬上界)→ TPM/预算预检(计量制)
+    → 租户预算兜底 → 每 key 并发上限。
 
     Redis 故障 = fail-closed 503(与鉴权/缓存的降级语义相反):准入承载计费硬上界,
     跳过意味着限流与预算全部失效 —— 宁可拒绝也不裸放。
+    返回 AdmitResult 供限流响应头使用。
     """
     state = request.app.state
     if auth.model_whitelist and model not in auth.model_whitelist:
@@ -256,6 +258,30 @@ async def _admit(request: Request, auth: AuthResult, model: str) -> None:
         raise GatewayError(
             402, "tenant budget exhausted", "insufficient_quota", "tenant_budget_exceeded",
         )
+    if auth.concurrency_limit is not None:
+        from app.ratelimit import concurrency
+
+        ok = await concurrency.acquire(state.redis, auth.key_id, auth.concurrency_limit)
+        if not ok:
+            raise GatewayError(
+                429, "concurrency limit exceeded for this key", "rate_limit_error",
+                "concurrency_exceeded", retry_after_s=1,
+            )
+    return r
+
+
+def _rate_limit_headers(auth: AuthResult | None, r: AdmitResult | None) -> dict:
+    """标准限流响应头(有鉴权且准入已执行时附带;匿名/纯代理模式不带)。"""
+    if auth is None or r is None:
+        return {}
+    reset_s = max(1, (r.retry_after_ms + 999) // 1000) if not r.rpm_allowed else max(
+        1, int(60 / max(auth.rpm_limit, 1))
+    )
+    return {
+        "x-ratelimit-limit-requests": str(auth.rpm_limit),
+        "x-ratelimit-remaining-requests": str(r.rpm_remaining),
+        "x-ratelimit-reset-requests": str(reset_s),
+    }
 
 
 def _record(
@@ -332,6 +358,12 @@ async def _enqueue_error(state, auth, model: str, request_id: str, status: int) 
             )
     except Exception as exc:
         logger.warning("error_record_enque_failed", error=str(exc))
+    finally:
+        # 错误路径没有 BackgroundTask 记账:并发槽在这里释放(成功路径由 _account 释放)
+        if auth is not None and auth.concurrency_limit is not None:
+            from app.ratelimit import concurrency
+
+            await concurrency.release(state.redis, auth.key_id)
 
 
 async def _account(request: Request, auth: AuthResult | None, record_or_factory) -> None:
@@ -340,6 +372,7 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
     顺序很重要:账本是事实来源,Redis 是可重建的缓存。先 enqueue 意味着即使
     记账时 Redis 抖动,账本仍在;预算计数可由 rebuild_from_db 修复。
     record_or_factory:流式路径传可调用对象(usage 流结束才可知)。
+    同时是并发槽的释放点(响应真正结束;流式在流末尾,这正是"在途"的语义)。
     """
     state = request.app.state
     record = record_or_factory() if callable(record_or_factory) else record_or_factory
@@ -387,6 +420,12 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
     except Exception as exc:
         logger.warning("queue_depth_metric_failed", error=str(exc))
 
+    # 并发槽释放(响应真正结束;DECR 下限 0,重复释放安全)
+    if auth is not None and auth.concurrency_limit is not None:
+        from app.ratelimit import concurrency
+
+        await concurrency.release(state.redis, auth.key_id)
+
 
 @router.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request) -> Response:
@@ -397,9 +436,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 
     # ---- 准入(auth_enabled=False 为纯代理模式,仅测试/内网边缘鉴权场景)----
     auth: AuthResult | None = None
+    r_admit = None
     if state.settings.auth_enabled:
         auth = await _authenticate(request, _bearer(request.headers.get("authorization")))
-        await _admit(request, auth, req.model)
+        r_admit = await _admit(request, auth, req.model)
+    rl_headers = _rate_limit_headers(auth, r_admit)
 
     # 计费模式下的流式请求强制 include_usage:否则客户端不传该参数时,
     # 上游不返回 usage,网关只能记 0 token(真实成本漏计)。请求体被增强,
@@ -515,6 +556,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "x-upstream-channel": channel or "exhausted",
+                **rl_headers,
             },
             background=BackgroundTask(_account, request, auth, make_record),
         )
@@ -545,7 +587,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             )
     try:
         return await _non_stream_core(
-            req, request, state, payload, request_id, request_t0, auth, idem_sk, forward_headers
+            req, request, state, payload, request_id, request_t0, auth, idem_sk,
+            forward_headers, rl_headers,
         )
     finally:
         if idem_sk is not None:
@@ -557,7 +600,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 async def _non_stream_core(
     req: ChatCompletionRequest, request: Request, state, payload: dict,
     request_id: str, request_t0: float, auth: AuthResult | None,
-    idem_sk: str | None, forward_headers: dict,
+    idem_sk: str | None, forward_headers: dict, rl_headers: dict | None = None,
 ) -> Response:
     """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。"""
     from app import idempotency
@@ -589,6 +632,31 @@ async def _non_stream_core(
             )
         metrics.CACHE_MISSES.inc()
 
+    # 单飞锁(P2 hardening):同 prompt 并发 miss 只放一个去上游,其余短轮询等填。
+    # 等到 → 直接回缓存;等不到(1s 预算耗尽)→ 自己执行,不陪葬持锁者。
+    sf_acquired = False
+    if rkey is not None:
+        if await response_cache.try_acquire(state.redis, rkey):
+            sf_acquired = True
+        else:
+            filled = await response_cache.wait_for_fill(state.redis, rkey)
+            if filled is not None:
+                latency_ms = (time.perf_counter() - request_t0) * 1000
+                record = _record(
+                    auth, req.model, request_id, 200, filled.get("usage"), None,
+                    latency_ms, channel="cache",
+                )
+                _record_metrics(auth, req.model, "cache", 200, filled.get("usage"),
+                                latency_ms=latency_ms)
+                return Response(
+                    content=json.dumps(filled, ensure_ascii=False).encode(),
+                    status_code=200,
+                    media_type="application/json",
+                    headers={"x-cache": "HIT", "x-upstream-channel": "cache",
+                             **(rl_headers or {})},
+                    background=BackgroundTask(_account, request, auth, record),
+                )
+
     # 语义缓存(精确未命中时):问题向量召回,阈值以上直接复用答案。
     # context_digest 绑定 system/历史消息与采样参数,防止不同 system prompt 串答案。
     semantic_ctx = None
@@ -601,6 +669,9 @@ async def _non_stream_core(
             question, state.settings.semantic_cache_threshold,
         )
         if hit is not None:
+            if sf_acquired:
+                await response_cache.release(state.redis, rkey)
+                sf_acquired = False
             metrics.CACHE_HITS.inc()
             logger.info("semantic_cache_hit", request_id=request_id, score=hit["score"])
             latency_ms = (time.perf_counter() - request_t0) * 1000
@@ -628,11 +699,15 @@ async def _non_stream_core(
     try:
         channel, resp = await _dispatch_non_stream(state, payload, forward_headers)
     except UPSTREAM_TRANSPORT_ERRORS as exc:
+        if sf_acquired:
+            await response_cache.release(state.redis, rkey)
         status, message, code = _classify_upstream_exc(exc)
         logger.warning("upstream_transport_error", error=str(exc), status=status)
         await _enqueue_error(state, auth, req.model, request_id, status)
         return _gateway_error(status, message, "bad_gateway", code)
     except GatewayError as exc:
+        if sf_acquired:
+            await response_cache.release(state.redis, rkey)
         await _enqueue_error(state, auth, req.model, request_id, exc.status)
         raise
 
@@ -647,6 +722,9 @@ async def _non_stream_core(
             usage = None
         if rkey is not None and body_json is not None:
             await response_cache.put(state.redis, rkey, body_json, state.settings.response_cache_ttl)
+            if sf_acquired:
+                await response_cache.release(state.redis, rkey)
+                sf_acquired = False
         # 语义缓存入库(精确与语义同源;问题取最后一条 user 消息)
         if (
             auth is not None
@@ -666,7 +744,9 @@ async def _non_stream_core(
         auth, req.model, channel or "exhausted", resp.status_code, usage,
         latency_ms=latency_ms if resp.status_code == 200 else None,
     )
-    extra_headers = {"x-upstream-channel": channel or "exhausted"}
+    if sf_acquired:
+        await response_cache.release(state.redis, rkey)  # 非 200 未填缓存:兜底释放
+    extra_headers = {"x-upstream-channel": channel or "exhausted", **(rl_headers or {})}
     if rkey is not None:
         extra_headers["x-cache"] = "MISS"
     if idem_sk is not None and 200 <= resp.status_code < 300 and body_json is not None:

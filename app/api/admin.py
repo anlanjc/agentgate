@@ -48,6 +48,7 @@ class KeyCreate(BaseModel):
     rpm_limit: int = Field(default=60, ge=1)
     tpm_limit: int = Field(default=100_000, ge=1)
     budget_tokens: int | None = Field(default=None, ge=0)
+    concurrency_limit: int | None = Field(default=None, ge=1)
     model_whitelist: list[str] | None = None
 
 
@@ -126,6 +127,7 @@ async def create_key(tenant_id: str, body: KeyCreate, request: Request) -> dict:
             rpm_limit=body.rpm_limit,
             tpm_limit=body.tpm_limit,
             budget_tokens=body.budget_tokens,
+            concurrency_limit=body.concurrency_limit,
         )
         db.add(vk)
         # detail 只放 prefix:raw key 绝不入审计(泄露审计=泄露可用 key)
