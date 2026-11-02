@@ -9,12 +9,19 @@ import secrets
 from dataclasses import dataclass
 
 import redis.asyncio as aredis
+from redis.exceptions import RedisError
 from sqlalchemy import select
 
 from app.db.models import VirtualKey
+from app.log import get_logger
+
+logger = get_logger("auth")
 
 KEY_PREFIX = "ag-"
 CACHE_TTL_SECONDS = 60
+
+# 降级语义:鉴权的事实来源是 PG,Redis 只是快路径 —— 缓存读/写失败都降级为
+# 直查 DB(网关不死);与准入的 fail-closed 相反,准入涉及计费上限,宁可拒不可漏。
 
 
 def hash_key(raw: str) -> str:
@@ -76,7 +83,11 @@ async def lookup(
 
     key_hash = hash_key(raw_key)
 
-    cached = await redis.get(_cache_key(key_hash))
+    try:
+        cached = await redis.get(_cache_key(key_hash))
+    except RedisError as exc:
+        logger.warning("auth_cache_read_degraded", error=str(exc))
+        cached = None
     if cached:
         data = json.loads(cached)
         if not data["is_active"]:
@@ -99,9 +110,13 @@ async def lookup(
     if not vk.is_active:
         raise KeyInactive(raw_key[:10])
 
-    await redis.set(
-        _cache_key(key_hash), _serialize(vk), ex=CACHE_TTL_SECONDS
-    )  # 请求路径唯一一次 Redis 写:缓存回填(LiteLLM 同款)
+    try:
+        await redis.set(
+            _cache_key(key_hash), _serialize(vk), ex=CACHE_TTL_SECONDS
+        )  # 请求路径唯一一次 Redis 写:缓存回填(LiteLLM 同款)
+    except RedisError as exc:
+        # 鉴权已成功(来源 DB),回填失败只损失快路径,不阻塞请求。
+        logger.warning("auth_cache_backfill_failed", error=str(exc))
     return AuthResult(
         key_id=vk.id,
         tenant_id=vk.tenant_id,

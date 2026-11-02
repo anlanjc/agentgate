@@ -219,13 +219,26 @@ async def _authenticate(request: Request, raw_key: str) -> AuthResult:
 
 
 async def _admit(request: Request, auth: AuthResult, model: str) -> None:
-    """准入三关(单次 Lua 往返):模型白名单 → RPM 令牌桶(硬上界)→ TPM 窗口/预算预检(计量制)。"""
+    """准入三关(单次 Lua 往返):模型白名单 → RPM 令牌桶(硬上界)→ TPM 窗口/预算预检(计量制)。
+
+    Redis 故障 = fail-closed 503(与鉴权/缓存的降级语义相反):准入承载计费硬上界,
+    跳过意味着限流与预算全部失效 —— 宁可拒绝也不裸放。
+    """
     state = request.app.state
     if auth.model_whitelist and model not in auth.model_whitelist:
         raise GatewayError(
             403, f"model '{model}' not allowed for this key", "invalid_request_error", "model_not_allowed"
         )
-    r = await admit(state.redis, key_id=auth.key_id, capacity=auth.rpm_limit, amount=1)
+    from redis.exceptions import RedisError
+
+    try:
+        r = await admit(state.redis, key_id=auth.key_id, capacity=auth.rpm_limit, amount=1)
+    except RedisError as exc:
+        logger.warning("admission_fail_closed", error=str(exc))
+        raise GatewayError(
+            503, "admission temporarily unavailable", "api_error",
+            "admission_unavailable", retry_after_s=5,
+        )
     if not r.rpm_allowed:
         raise GatewayError(
             429, "rpm limit exceeded", "rate_limit_error", "rpm_exceeded",

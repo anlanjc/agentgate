@@ -16,7 +16,14 @@ import math
 import time
 from typing import Protocol
 
+from redis.exceptions import RedisError
+
 from app.config import Settings
+from app.log import get_logger
+
+logger = get_logger("cache.semantic")
+
+# 降级语义同 response.py:缓存是优化不是正确性,Redis 故障当 miss(可观测,不阻塞请求)。
 
 
 class Embedder(Protocol):
@@ -133,7 +140,11 @@ async def search(
     """余弦扫描召回;命中返回缓存条目(answer/usage),未命中 None。"""
     vec = await embedder.embed(question)
     idx = _index_key(tenant_id, model, ctx)
-    members = await redis.zrange(idx, 0, max_scan - 1, desc=True)  # 时间倒序近似最近优先
+    try:
+        members = await redis.zrange(idx, 0, max_scan - 1, desc=True)  # 时间倒序近似最近优先
+    except RedisError as exc:
+        logger.warning("semantic_cache_read_degraded", error=str(exc))
+        return None
     if not members:
         return None
     # 一次 MGET 取候选向量,而不是 N 次串行 GET(N=200 时是 200 个 RTT)。
@@ -144,7 +155,11 @@ async def search(
         )
         for m in members
     ]
-    raws = await redis.mget(keys)
+    try:
+        raws = await redis.mget(keys)
+    except RedisError as exc:
+        logger.warning("semantic_cache_read_degraded", error=str(exc))
+        return None
     best: tuple[float, dict] | None = None
     for raw in raws:
         if raw is None:
@@ -176,13 +191,16 @@ async def store(
     vec = await embedder.embed(question)
     d = _digest(vec)
     idx = _index_key(tenant_id, model, ctx)
-    pipe = redis.pipeline(transaction=False)
-    pipe.set(
-        _entry_key(tenant_id, model, ctx, d),
-        json.dumps({"vector": vec, "question": question, "answer": body}, ensure_ascii=False),
-        ex=ttl,
-    )
-    pipe.zadd(idx, {d: time.time()})
-    pipe.zremrangebyrank(idx, 0, -201)  # 索引上限 200 条(演示规模;规模化见模块头)
-    pipe.expire(idx, ttl)
-    await pipe.execute()
+    try:
+        pipe = redis.pipeline(transaction=False)
+        pipe.set(
+            _entry_key(tenant_id, model, ctx, d),
+            json.dumps({"vector": vec, "question": question, "answer": body}, ensure_ascii=False),
+            ex=ttl,
+        )
+        pipe.zadd(idx, {d: time.time()})
+        pipe.zremrangebyrank(idx, 0, -201)  # 索引上限 200 条(演示规模;规模化见模块头)
+        pipe.expire(idx, ttl)
+        await pipe.execute()
+    except RedisError as exc:
+        logger.warning("semantic_cache_write_degraded", error=str(exc))

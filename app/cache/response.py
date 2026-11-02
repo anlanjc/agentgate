@@ -11,7 +11,15 @@
 import hashlib
 import json
 
+from redis.exceptions import RedisError
+
 from app.config import Settings
+from app.log import get_logger
+
+logger = get_logger("cache.response")
+
+# 降级语义:缓存是优化不是正确性,Redis 故障一律当 miss 处理(可观测,不阻塞请求)。
+# 与准入的 fail-closed 相反 —— 那里涉及计费上限,宁可拒不可漏。
 
 
 def cache_enabled(settings: Settings, req) -> bool:
@@ -37,7 +45,11 @@ def cache_key(tenant_id: str, model: str, payload: dict) -> str:
 
 
 async def get(redis, key: str) -> dict | None:
-    raw = await redis.get(key)
+    try:
+        raw = await redis.get(key)
+    except RedisError as exc:
+        logger.warning("response_cache_read_degraded", error=str(exc))
+        return None
     if raw is None:
         return None
     try:
@@ -49,4 +61,7 @@ async def get(redis, key: str) -> dict | None:
 async def put(redis, key: str, body: dict, ttl: int) -> None:
     if ttl <= 0:
         return
-    await redis.set(key, json.dumps(body, ensure_ascii=False), ex=ttl)
+    try:
+        await redis.set(key, json.dumps(body, ensure_ascii=False), ex=ttl)
+    except RedisError as exc:
+        logger.warning("response_cache_write_degraded", error=str(exc))

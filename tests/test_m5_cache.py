@@ -128,3 +128,40 @@ async def test_admin_purge(cache_gateway):
     assert r.status_code == 200 and r.json()["purged"] >= 1
     r2 = await client.post("/v1/chat/completions", json=_body(), headers=h)
     assert r2.headers["x-cache"] == "MISS"  # 清空后重新回源
+
+
+async def test_cache_redis_error_degrades_to_miss():
+    """缓存是优化不是正确性:Redis 故障一律当 miss/写失败跳过,不阻塞请求。
+
+    与准入 fail-closed 相反的降级语义 —— 那里涉及计费硬上界,这里只是快路径。
+    """
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from app.cache import response as response_cache
+    from app.cache import semantic as semantic_cache
+
+    class _Dead:
+        async def get(self, *a, **k):
+            raise RedisConnectionError("down")
+
+        async def set(self, *a, **k):
+            raise RedisConnectionError("down")
+
+        async def zrange(self, *a, **k):
+            raise RedisConnectionError("down")
+
+        async def mget(self, *a, **k):
+            raise RedisConnectionError("down")
+
+        def pipeline(self, *a, **k):
+            raise RedisConnectionError("down")
+
+    class _Emb:
+        async def embed(self, text: str) -> list[float]:
+            return [1.0, 0.0]
+
+    dead = _Dead()
+    assert await response_cache.get(dead, "resp:x") is None
+    await response_cache.put(dead, "resp:x", {"a": 1}, ttl=60)  # 不抛即通过
+    assert await semantic_cache.search(dead, _Emb(), "t", "m", "ctx", "q", 0.9) is None
+    await semantic_cache.store(dead, _Emb(), "t", "m", "ctx", "q", {"a": 1}, ttl=60)  # 不抛即通过

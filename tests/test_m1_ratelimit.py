@@ -70,3 +70,81 @@ async def test_route_rpm_429(auth_gateway):
     assert r3.status_code == 429
     assert r3.json()["error"]["code"] == "rpm_exceeded"
     assert int(r3.headers["Retry-After"]) >= 1
+
+
+# ---------- Redis 故障语义(P0-C):准入 fail-closed,鉴权降级 ----------
+
+
+class _DeadRedis:
+    """全故障注入:所有直连方法抛 redis.exceptions.ConnectionError(模拟宕机)。
+
+    必须用 redis 自己的异常类型:代码层捕获 RedisError,redis-py 连不上时抛的
+    正是它的 ConnectionError(RedisError 子类)——注入要贴近真实故障面。"""
+
+    def __init__(self, real):
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        self._exc = RedisConnectionError("redis down")
+        self._real = real
+
+    async def get(self, *a, **k):
+        raise self._exc
+
+    async def set(self, *a, **k):
+        raise self._exc
+
+    async def evalsha(self, *a, **k):
+        raise self._exc
+
+    async def script_load(self, *a, **k):
+        raise self._exc
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+async def test_redis_down_admission_fails_closed(auth_gateway):
+    """Redis 挂:准入 fail-closed 503(明确错误码+Retry-After),不是未处理 500。
+
+    设计依据:准入承载计费硬上界(限流桶/TPM/预算),跳过 = 限额全部失效,
+    宁可拒绝也不裸放;与鉴权/缓存的降级语义相反(那些是只读快路径)。
+    """
+    client, app, mock, raw = auth_gateway
+    app.state.redis = _DeadRedis(app.state.redis)
+    r = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
+    assert r.status_code == 503
+    body = r.json()["error"]
+    assert body["code"] == "admission_unavailable"
+    assert int(r.headers["Retry-After"]) >= 1
+
+
+class _AuthCacheDeadRedis:
+    """部分故障注入:只挂鉴权缓存的 get/set,其余(Lua 准入等)放行 ——
+    对应真实故障面:缓存不可用但 Lua 脚本可用(或反之),各路径独立降级。"""
+
+    def __init__(self, real):
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        self._exc = RedisConnectionError("redis down")
+        self._real = real
+
+    async def get(self, *a, **k):
+        raise self._exc
+
+    async def set(self, *a, **k):
+        raise self._exc
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+async def test_redis_down_auth_degrades_to_db(auth_gateway):
+    """鉴权缓存挂:降级直查 DB(事实来源),请求照常成功——缓存读/回填失败不阻塞。
+
+    注意与 fail-closed 的边界:准入(Lua)在此可用;若准入也不可用,上一条测试
+    证明会 503。两条故障面独立降级,语义各自成立。
+    """
+    client, app, mock, raw = auth_gateway
+    app.state.redis = _AuthCacheDeadRedis(app.state.redis)
+    r = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
+    assert r.status_code == 200

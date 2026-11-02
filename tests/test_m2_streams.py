@@ -223,3 +223,87 @@ async def test_webhook_e2e(auth_settings, redis_client):
     finally:
         server.should_exit = True
         await server_task
+
+
+# ---------- outbox 故障注入(P0-C):双写空洞的闭环证据 ----------
+
+
+async def test_outbox_sweeper_republishes_after_xadd_failure(queue_env, monkeypatch):
+    """XADD 抛异常(DB 已提交、消息未投递)→ published_at 为空 → sweeper 补投 →
+    消费成功且只执行一次。"DB 提交但 Redis 没收到"的双写空洞被补投路径闭环。"""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from sqlalchemy import select
+
+    from app.db.models import TaskRecord
+
+    q, sf, received, redis = queue_env
+    monkeypatch.setattr("app.queue.streams.OUTBOX_GRACE_SECONDS", 0.0)  # 免等 grace 期
+
+    real_xadd = redis.xadd
+    state = {"failed": False}
+
+    async def flaky_xadd(*a, **k):
+        if not state["failed"]:
+            state["failed"] = True  # 只让第一次(XADD 入队)失败
+            raise RedisConnectionError("redis down")
+        return await real_xadd(*a, **k)
+
+    monkeypatch.setattr(redis, "xadd", flaky_xadd)
+
+    async with sf() as db:
+        tid = await q.enqueue(db, "t", {"x": 42}, idempotency_key="outbox-1")
+    async with sf() as db:
+        row = (await db.execute(select(TaskRecord).where(TaskRecord.id == tid))).scalar_one()
+        assert row.published_at is None  # DB 已提交、投递未确认 = outbox 待补
+    assert await redis.xlen(TASK_STREAM) == 0
+
+    assert await q._outbox_sweep() == 1  # Redis 恢复(flaky 放行),sweeper 补投
+    async with sf() as db:
+        row = (await db.execute(select(TaskRecord).where(TaskRecord.id == tid))).scalar_one()
+        assert row.published_at is not None
+
+    await q.start()
+    for _ in range(100):
+        if q.processed >= 1:
+            break
+        await asyncio.sleep(0.02)
+    assert received == [{"type": "t", "x": 42}]
+    assert await q._outbox_sweep() == 0  # 幂等:已投递的不再补
+
+
+async def test_marker_loss_republishes_but_consumes_once(queue_env, monkeypatch):
+    """反向用例:水位回写失败(消息已投递、尚未消费的真实窗口)→ sweeper 重复投递 →
+    消费端状态机幂等吞掉,handler 仍只执行一次 —— at-least-once 不放大副作用。"""
+    from sqlalchemy import update
+
+    from app.db.models import TaskRecord
+
+    _, sf, received, redis = queue_env
+    monkeypatch.setattr("app.queue.streams.OUTBOX_GRACE_SECONDS", 0.0)
+    q = TaskQueue(redis, sf, _collect_with(received), auto_start=False)
+
+    async with sf() as db:
+        tid = await q.enqueue(db, "t", {"x": 7}, idempotency_key="outbox-2")
+    assert await redis.xlen(TASK_STREAM) == 1  # 已投递
+
+    async with sf() as db:  # 模拟水位丢失(回写失败的历史窗口:已投递未消费)
+        await db.execute(update(TaskRecord).where(TaskRecord.id == tid).values(published_at=None))
+        await db.commit()
+    assert await q._outbox_sweep() == 1  # 重复投递
+    assert await redis.xlen(TASK_STREAM) == 2
+
+    await q.start()  # 消费两条同 task_id 消息
+    for _ in range(100):
+        if await q.backlog() == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert received == [{"type": "t", "x": 7}]  # handler 只执行一次
+    assert q.processed == 1
+    assert await redis.xlen(TASK_STREAM) == 0  # 两条都被 ACK+DEL
+
+
+def _collect_with(received: list):
+    async def handler(task_type: str, payload: dict) -> dict:
+        received.append({"type": task_type, **payload})
+        return {"ok": True}
+    return handler
