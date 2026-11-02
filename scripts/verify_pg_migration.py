@@ -48,7 +48,37 @@ def main() -> None:
     missing = expected - tables
     assert not missing, f"缺表: {missing}(实际输出: {sorted(tables)[:12]})"
     print(f"[3] PG 表验证通过: {sorted(expected)}")
-    print("✅ 迁移在真 PostgreSQL 上验证通过")
+
+    # 验 7c1f4a9b2d10 迁移产物(outbox 水位/账本幂等/渠道超时)
+    def _col(table: str, col: str) -> str:
+        return db.psql(
+            "select is_nullable from information_schema.columns "
+            f"where table_name='{table}' and column_name='{col}';"
+        )
+
+    published = db.psql(
+        "select count(*) from information_schema.columns "
+        "where table_name='task_records' and column_name='published_at';"
+    )
+    assert published.splitlines()[2].strip() == "1", "task_records.published_at 缺失"
+    timeouts = db.psql(
+        "select count(*) from information_schema.columns "
+        "where table_name='channels' and column_name in ('connect_timeout','read_timeout');"
+    )
+    assert timeouts.splitlines()[2].strip() == "2", "channels 超时列缺失"
+    key_nullable = _col("usage_records", "key_id").splitlines()[2].strip()
+    assert key_nullable == "YES", f"usage_records.key_id 应可空(纯代理模式),实际 {key_nullable}"
+    uq = db.psql(
+        "select count(*) from information_schema.table_constraints "
+        "where table_name='usage_records' and constraint_name='uq_usage_tenant_request';"
+    )
+    assert uq.splitlines()[2].strip() == "1", "uq_usage_tenant_request 唯一约束缺失"
+    print("[4] 7c1f4a9b2d10 迁移产物验证通过:published_at/超时列/key_id 可空/唯一约束")
+
+    # 幂等:再次 upgrade head 应为无操作(no-op)
+    command.upgrade(cfg, "head")
+    print("[5] alembic upgrade head 幂等重跑通过")
+    print("✅ 迁移在真 PostgreSQL 上验证通过(含 hardening 迁移)")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
-# Python
+# Python / tooling
 __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # 本机运行产物(不入库)
 *.db
