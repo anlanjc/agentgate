@@ -42,7 +42,7 @@ async def test_mcp_tools_share_state_with_gateway(auth_gateway, tmp_path):
     for _ in range(2):
         r = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
         assert r.status_code == 200
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
 
     # MCP 子进程与网关 app 共享同一 DB/Redis(直接取 app 实际配置,避免两套路径不一致)
     settings = app.state.settings

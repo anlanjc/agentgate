@@ -211,25 +211,45 @@ def _record(
     }
 
 
-async def _account(request: Request, auth: AuthResult | None, record_or_factory) -> None:
-    """响应完成后的记账(BackgroundTask):预算/TPM 计数(Redis 原子)+ 账本落库(单写者队列)。
+async def _enqueue_error(state, auth, model: str, request_id: str, status: int) -> None:
+    """错误路径的账本行:也走 Streams(错误低频,允许路径内小开销换全链一致)。"""
+    from app.queue.streams import TaskQueue
 
-    record_or_factory:流式路径传可调用对象(usage 在流结束后才可知,后台执行时才求值);
-    非流式路径直接传 dict。webhook 回调任务在此上下文入队(允许 DB 访问)。
+    tq: TaskQueue = state.task_queue
+    try:
+        async with state.session_factory() as db:
+            await tq.enqueue(
+                db, "usage_write",
+                _record(auth, model, request_id, status, None, None, 0),
+                idempotency_key=f"usage:{request_id}",
+            )
+    except Exception as exc:
+        logger.warning("error_record_enque_failed", error=str(exc))
+
+
+async def _account(request: Request, auth: AuthResult | None, record_or_factory) -> None:
+    """响应完成后的记账(BackgroundTask):预算/TPM 计数(Redis 原子)+ 账本走持久队列。
+
+    v3 升级:账本行经 Streams(at-least-once + 幂等键 usage:{request_id})落库 ——
+    网关崩溃在途账本不再丢;原进程内单写者退役(ADR-004)。
+    record_or_factory:流式路径传可调用对象(usage 流结束才可知)。
     """
     state = request.app.state
     record = record_or_factory() if callable(record_or_factory) else record_or_factory
     if auth is not None and record["status"] == 200 and record["total_tokens"] > 0:
         await quota_service.account_tokens(state.redis, auth.key_id, record["total_tokens"])
-    state.writer.submit(record)
-    metrics.USAGE_QUEUE_DEPTH.set(state.writer._queue.qsize())
 
-    # webhook 回调(幂等键=request_id):请求完成事件推送给订阅方
-    if auth is not None and record["status"] == 200 and state.settings.auth_enabled:
-        from app.queue.streams import TaskQueue
+    from app.queue.streams import TaskQueue
 
-        tq: TaskQueue = state.task_queue
-        async with state.session_factory() as db:
+    tq: TaskQueue = state.task_queue
+    async with state.session_factory() as db:
+        await tq.enqueue(
+            db, "usage_write", record,
+            idempotency_key=f"usage:{record['request_id']}",
+        )
+
+        # webhook 回调(幂等键=request_id):请求完成事件推送给订阅方
+        if auth is not None and record["status"] == 200 and state.settings.auth_enabled:
             tenant = (
                 await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
             ).scalar_one_or_none()
@@ -245,6 +265,7 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
                     },
                     idempotency_key=f"webhook:{record['request_id']}",
                 )
+    metrics.USAGE_QUEUE_DEPTH.set(await tq.backlog())
 
 
 @router.post("/chat/completions")
@@ -268,7 +289,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
         except UPSTREAM_TRANSPORT_ERRORS as exc:
             status, message, code = _classify_upstream_exc(exc)
             logger.warning("upstream_transport_error", error=str(exc), status=status)
-            state.writer.submit(_record(auth, req.model, request_id, status, None, None, 0))
+            await _enqueue_error(state, auth, req.model, request_id, status)
             return _gateway_error(status, message, "bad_gateway", code)
 
         if not opened:
@@ -400,7 +421,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     except UPSTREAM_TRANSPORT_ERRORS as exc:
         status, message, code = _classify_upstream_exc(exc)
         logger.warning("upstream_transport_error", error=str(exc), status=status)
-        state.writer.submit(_record(auth, req.model, request_id, status, None, None, 0))
+        await _enqueue_error(state, auth, req.model, request_id, status)
         return _gateway_error(status, message, "bad_gateway", code)
 
     latency_ms = (time.perf_counter() - t0) * 1000

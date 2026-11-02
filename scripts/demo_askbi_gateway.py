@@ -161,7 +161,7 @@ async def main() -> None:
             ]
             print(f"[4] Q={q} → 200 via {channel}({dt:.0f}ms)答案 {len(answer)} 字")
 
-        await app.state.writer.flush()
+        await app.state.task_queue.flush()
         from sqlalchemy import func, select
 
         from app.db.models import UsageRecord

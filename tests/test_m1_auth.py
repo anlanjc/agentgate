@@ -35,7 +35,7 @@ async def test_valid_key_200_and_ledger(auth_gateway):
     client, app, mock, raw = auth_gateway
     resp = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
     assert resp.status_code == 200
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
     assert usage["requests"] == 1
     assert usage["total_tokens"] == 18
@@ -64,6 +64,10 @@ async def test_cache_first_serves_after_db_row_gone(auth_gateway):
     assert r1.status_code == 200
 
     async with app.state.session_factory() as db:
+        # PG 强制外键:先清该 key 的账本行,再删 key(SQLite 口径两步均幂等)
+        from app.db.models import UsageRecord
+
+        await db.execute(delete(UsageRecord).where(UsageRecord.key_id == KEY_ID))
         await db.execute(delete(VirtualKey).where(VirtualKey.id == KEY_ID))
         await db.commit()
 
@@ -98,4 +102,4 @@ async def test_admin_token_protects(auth_settings, redis_client):
             "/admin/tenants", json={"name": "x"}, headers={"X-Admin-Token": "secret-token"}
         )
         assert r2.status_code == 200
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()

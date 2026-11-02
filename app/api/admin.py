@@ -127,11 +127,14 @@ class ChannelCreate(BaseModel):
 async def register_channel(body: ChannelCreate, request: Request) -> dict:
     """把任意 OpenAI 兼容服务注册为网关渠道(含自家 Agent 应用),无需重启。
 
-    渠道健康状态(EMA/冷却)存 Redis —— 多副本共享;注册动作进程内生效。
+    双写:运行时注册(立即生效)+ channels 表持久化(重启由 load_channels_from_db 恢复)。
     进程内测试请直接调 ChannelRouter.register(不走本端点)。
     """
     _require_admin(request)
 
+    import uuid as _uuid
+
+    from app.db.models import Channel
     from app.router.failover import ChannelRouter
     from app.upstream.client import UpstreamClient
 
@@ -147,7 +150,27 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
         trust_env=request.app.state.settings.llm_trust_env,
     )
     router.register(body.name, client, body.models)
-    return {"channel": body.name, "models": body.models, "registered": True}
+
+    # 持久化(ADR-005):重启恢复
+    async with request.app.state.session_factory() as db:
+        from sqlalchemy import select
+
+        row = await db.execute(select(Channel).where(Channel.name == body.name))
+        ch = row.scalar_one_or_none()
+        if ch is None:
+            db.add(
+                Channel(
+                    id=_uuid.uuid4().hex[:32], name=body.name, base_url=body.base_url,
+                    api_key=body.api_key, models=body.models,
+                )
+            )
+            await db.commit()
+        else:
+            ch.base_url, ch.api_key, ch.models, ch.is_active = (
+                body.base_url, body.api_key, body.models, True,
+            )
+            await db.commit()
+    return {"channel": body.name, "models": body.models, "registered": True, "persisted": True}
 
 
 @router.delete("/cache")

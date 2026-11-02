@@ -84,7 +84,7 @@ async def test_failover_on_500(auth_settings, redis_client):
         await client.aclose()
         await ua.aclose()
         await ub.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
 
 
 async def test_429_respects_retry_after(auth_settings, redis_client):
@@ -102,7 +102,7 @@ async def test_429_respects_retry_after(auth_settings, redis_client):
         await client.aclose()
         await ua.aclose()
         await ub.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
 
 
 async def test_latency_based_routing(auth_settings, redis_client):
@@ -119,7 +119,7 @@ async def test_latency_based_routing(auth_settings, redis_client):
         await client.aclose()
         await ua.aclose()
         await ub.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
 
 
 async def test_all_channels_fail_passthrough(auth_settings, redis_client):
@@ -134,7 +134,7 @@ async def test_all_channels_fail_passthrough(auth_settings, redis_client):
         await client.aclose()
         await ua.aclose()
         await ub.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
 
 
 async def test_stream_failover(auth_settings, redis_client):
@@ -151,7 +151,7 @@ async def test_stream_failover(auth_settings, redis_client):
         await client.aclose()
         await ua.aclose()
         await ub.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
 
 
 async def test_redis_down_router_degrades():

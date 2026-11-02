@@ -105,15 +105,29 @@ async def test_failure_retries_then_dead_letter(queue_env):
         assert row.status == "dead" and row.attempts == 3
 
 
-async def test_crash_recovery_claims_stale_pending(queue_env):
-    """崩溃恢复:幽灵消费者认领后消失,新 worker 通过 XCLAIM 收编 pending 并完成。"""
-    q, sf, received, redis = queue_env
+async def test_crash_recovery_claims_stale_pending(tmp_path, redis_client):
+    """崩溃恢复:幽灵消费者认领后消失,新 worker 通过 XCLAIM 收编 pending 并完成。
+
+    用 auto_start=False 的队列:enqueue 不拉 worker,保住"幽灵先读"的时序。
+    """
+    from app.db.session import build_engine, build_session_factory, init_db
+
+    engine = build_engine(f"sqlite+aiosqlite:///{tmp_path}/crash.db")
+    await init_db(engine)
+    sf = build_session_factory(engine)
+    received: list[dict] = []
+
+    async def handler(task_type: str, payload: dict) -> dict:
+        received.append({"type": task_type, **payload})
+        return {"ok": True}
+
+    q = TaskQueue(redis_client, sf, handler, max_attempts=3, claim_idle_ms=150, auto_start=False)
     async with sf() as db:
         await q.enqueue(db, "t", {"x": 9}, idempotency_key="idem-crash")
 
     await q.ensure_group()
     # 模拟崩溃:ghost 消费者读取但从不处理/ACK
-    msgs = await redis.xreadgroup(GROUP, "ghost-consumer", {TASK_STREAM: ">"}, count=10, block=100)
+    msgs = await redis_client.xreadgroup(GROUP, "ghost-consumer", {TASK_STREAM: ">"}, count=10, block=100)
     assert msgs  # ghost 拿到了消息,然后"崩溃"
 
     await q.start()  # 正式 worker 上线,claim_idle=150ms 后收编
@@ -123,6 +137,8 @@ async def test_crash_recovery_claims_stale_pending(queue_env):
         await asyncio.sleep(0.03)
     assert q.processed == 1
     assert received == [{"type": "t", "x": 9}]
+    await q.stop()
+    await engine.dispose()
 
 
 async def test_webhook_e2e(auth_settings, redis_client):
@@ -199,7 +215,7 @@ async def test_webhook_e2e(auth_settings, redis_client):
 
         await app.state.task_queue.stop()
         await upstream.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
     finally:
         server.should_exit = True
         await server_task

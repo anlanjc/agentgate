@@ -153,7 +153,7 @@ async def gateway(settings, redis_client):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
         yield client, app, mock_app
     await upstream.aclose()
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()
 
 
 @pytest.fixture
@@ -178,7 +178,7 @@ async def auth_gateway(auth_settings, redis_client):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
         yield client, app, mock_app, raw
     await upstream.aclose()
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()
 
 
 def auth_headers(raw_key: str) -> dict:

@@ -54,7 +54,7 @@ async def cache_gateway(cache_settings, redis_client):
     ) as client:
         yield client, app, raw
     await upstream.aclose()
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()
 
 
 async def test_second_request_hits_cache(cache_gateway):
@@ -101,10 +101,10 @@ async def test_cache_ledger_marks_channel_cache(cache_gateway):
     client, app, raw = cache_gateway
     h = auth_headers(raw)
     await client.post("/v1/chat/completions", json=_body(), headers=h)
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     r2 = await client.post("/v1/chat/completions", json=_body(), headers=h)
     assert r2.headers["x-cache"] == "HIT"
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     usage = (await client.get("/admin/tenants/t-c1/usage")).json()
     assert usage["requests"] == 2 and usage["total_tokens"] == 36
 

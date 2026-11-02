@@ -38,6 +38,7 @@ class TaskQueue:
         max_attempts: int = 3,
         claim_idle_ms: int = 500,
         batch: int = 16,
+        auto_start: bool = True,
     ) -> None:
         self._redis = redis
         self._session_factory = session_factory
@@ -46,6 +47,7 @@ class TaskQueue:
         self._max_attempts = max_attempts
         self._claim_idle_ms = claim_idle_ms
         self._batch = batch
+        self._auto_start = auto_start  # False:测试显式控制启动时序(如幽灵消费者场景)
         self._task: asyncio.Task | None = None
         self.processed = 0
         self.dead = 0
@@ -56,6 +58,8 @@ class TaskQueue:
         self, db: AsyncSession, task_type: str, payload: dict, idempotency_key: str
     ) -> str:
         """幂等入队:UNIQUE 约束兜底,重复键返回既有 task_id,不再 XADD。"""
+        if self._auto_start:
+            await self.ensure_started()
         row = await db.execute(
             select(TaskRecord).where(TaskRecord.idempotency_key == idempotency_key)
         )
@@ -99,6 +103,12 @@ class TaskQueue:
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(self._run())
 
+    async def ensure_started(self) -> None:
+        """惰性启动(首次 enqueue 即拉起 worker;幂等,测试/生产同一语义)。"""
+        await self.ensure_group()
+        if self._task is None:
+            await self.start()
+
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
@@ -107,6 +117,30 @@ class TaskQueue:
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    async def backlog(self) -> int:
+        """待处理量:未投递 + pending(可观测口径)。"""
+        total = int(await self._redis.xlen(TASK_STREAM))
+        try:
+            info = await self._redis.xpending(TASK_STREAM, GROUP)
+            total += int(info.get("pending", 0) or 0)
+        except Exception as e:
+            logger.warning("backlog_probe_failed", error=str(e))
+        return total
+
+    async def flush(self, timeout: float = 5.0) -> None:
+        """测试/收尾语义:等待流水清空(未投递与 pending 均归零)。
+
+        worker 在跑时被动等待;worker 未启动时主动同步抽干(不依赖事件循环调度)。
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if await self.backlog() == 0:
+                return
+            if self._task is None:
+                await self._read_new()
+                await self._reclaim_stale()
+            await asyncio.sleep(0.02)
 
     async def _run(self) -> None:
         while True:

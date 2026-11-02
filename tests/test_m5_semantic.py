@@ -64,7 +64,7 @@ async def sem_gateway(sem_settings, redis_client):
             )
         ).json()["key"]
     await upstream.aclose()
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()
 
 
 async def test_paraphrase_hits_semantic_cache(sem_gateway):

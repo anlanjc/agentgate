@@ -95,7 +95,7 @@ async def main() -> None:
                     headers={"Authorization": f"Bearer {raw}"},
                 )
                 assert r.status_code == 200, r.text
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     print("管理台演示栈就绪:http://127.0.0.1:8123/admin/web")
 
     try:
@@ -104,7 +104,7 @@ async def main() -> None:
         pass
     finally:
         await upstream.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
         await redis.aclose()
 
 

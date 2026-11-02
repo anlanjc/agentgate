@@ -176,7 +176,7 @@ async def main() -> None:
             )
 
         # 账本落库验证
-        await app.state.writer.flush()
+        await app.state.task_queue.flush()
         from sqlalchemy import func, select
 
         from app.db.models import UsageRecord
@@ -196,7 +196,7 @@ async def main() -> None:
     finally:
         server.should_exit = True
         await upstream.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
         await redis.aclose()
 
 

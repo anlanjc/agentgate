@@ -250,7 +250,7 @@ async def main() -> None:
         gw_server.should_exit = True
         bare_server.should_exit = True
         await upstream.aclose()
-        await app.state.writer.stop()
+        await app.state.task_queue.stop()
         await redis.aclose()
 
 

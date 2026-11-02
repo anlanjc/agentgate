@@ -54,7 +54,7 @@ async def test_ledger_nonstream_and_stream(auth_gateway):
         "/v1/chat/completions", json=_body(stream=True, stream_options={"include_usage": True}), headers=h
     )
     assert r1.status_code == r2.status_code == 200
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
     assert usage["requests"] == 2
     assert usage["total_tokens"] == 36  # mock 每 次 18(流式由 usage 提取器从最终 chunk 解出)
@@ -70,7 +70,7 @@ async def test_concurrent_accounting_atomic(auth_gateway):
     assert all(r.status_code == 200 for r in responses)
     window = await quota_service.tpm_window_get(app.state.redis, "k-test")
     assert window == 1800, f"原子性破约:window={window}"
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
     usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
     assert usage["requests"] == 100
     assert usage["total_tokens"] == 1800
@@ -82,7 +82,7 @@ async def test_budget_rebuild_from_db(auth_gateway):
     h = auth_headers(raw)
     for _ in range(3):
         await client.post("/v1/chat/completions", json=_body(), headers=h)
-    await app.state.writer.flush()
+    await app.state.task_queue.flush()
 
     await app.state.redis.delete(quota_service.budget_key("k-test"))
     async with app.state.session_factory() as db:

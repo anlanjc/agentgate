@@ -86,10 +86,10 @@ async def test_runtime_channel_registration_and_failover(agent_settings, redis_c
         assert resp.headers["x-upstream-channel"] == "agent-b"
 
         # 3) 账本照记且渠道标注正确
-        await app.state.writer.flush()
+        await app.state.task_queue.flush()
         usage = (await client.get("/admin/tenants/t-m4/usage")).json()
         assert usage["requests"] == 1 and usage["total_tokens"] == 18
 
     await agent_a.aclose()
     await agent_b.aclose()
-    await app.state.writer.stop()
+    await app.state.task_queue.stop()

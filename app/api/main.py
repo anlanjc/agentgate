@@ -17,10 +17,37 @@ from app.db.session import build_engine, build_session_factory
 from app.errors import GatewayError, gateway_error_handler
 from app.log import configure_logging, get_logger
 from app.middleware import RequestContextMiddleware
-from app.quota.writer import UsageWriter
 from app.upstream.client import UpstreamClient
 
 logger = get_logger("app")
+
+
+async def load_channels_from_db(app_: FastAPI) -> int:
+    """从 channels 表恢复渠道注册(重启不丢运行时注册;ADR-005)。
+
+    表里已有但路由未注册的才注册;settings 默认渠道优先。返回本次恢复数。
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Channel
+
+    router = app_.state.channel_router
+    settings = app_.state.settings
+    restored = 0
+    async with app_.state.session_factory() as db:
+        rows = (await db.execute(select(Channel).where(Channel.is_active))).scalars().all()
+    for ch in rows:
+        if ch.name in router.names:
+            continue
+        client = UpstreamClient(
+            ch.base_url, ch.api_key,
+            trust_env=settings.llm_trust_env,
+        )
+        router.register(ch.name, client, ch.models)
+        restored += 1
+    if restored:
+        logger.info("channels_restored", count=restored)
+    return restored
 
 
 def create_app(
@@ -36,8 +63,10 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
         logger.info("app_started", version=__version__, upstream=settings.upstream_name)
+        # 生产启动:从 channels 表恢复渠道注册(运行时注册的重启不丢)
+        await load_channels_from_db(app_)
         yield
-        await app_.state.writer.stop()
+        await app_.state.task_queue.stop()
         await app_.state.redis.aclose()
         await app_.state.engine.dispose()
         logger.info("app_stopped")
@@ -52,7 +81,6 @@ def create_app(
     app_.state.redis = redis_client or aredis.from_url(
         settings.redis_url, decode_responses=True, protocol=2
     )
-    app_.state.writer = UsageWriter(app_.state.session_factory)
     app_.state.upstream = upstream or UpstreamClient(
         settings.upstream_base_url,
         settings.upstream_api_key,
@@ -77,15 +105,17 @@ def create_app(
 
             app_.state.embedder = HashEmbedder()
 
-    # M2:渠道注册表(默认渠道 = settings 指向的上游)+ 任务队列(webhook 回调)
+    # M2:渠道注册表(默认渠道 = settings 指向的上游)+ 任务队列(webhook 回调 + 账本落库,自吃狗粮)
     from app.queue.streams import TaskQueue
-    from app.queue.webhooks import webhook_handler
+    from app.queue.webhooks import make_task_handler
     from app.router.failover import ChannelRouter
 
     channel_router = ChannelRouter(app_.state.redis)
     channel_router.register(settings.upstream_name, app_.state.upstream, settings.models)
     app_.state.channel_router = channel_router
-    app_.state.task_queue = TaskQueue(app_.state.redis, app_.state.session_factory, webhook_handler)
+    app_.state.task_queue = TaskQueue(
+        app_.state.redis, app_.state.session_factory, make_task_handler(app_.state.session_factory)
+    )
 
     app_.add_middleware(RequestContextMiddleware)
     app_.add_exception_handler(GatewayError, gateway_error_handler)
@@ -95,6 +125,33 @@ def create_app(
     @app_.get("/health")
     async def health() -> dict:
         return {"status": "ok", "version": __version__}
+
+    @app_.get("/ready")
+    async def ready() -> dict:
+        """就绪检查(k8s readiness):Redis ping + DB select——任一失败即 503。"""
+        from sqlalchemy import text
+
+        checks = {}
+        ok = True
+        try:
+            await app_.state.redis.ping()
+            checks["redis"] = "ok"
+        except Exception as e:
+            checks["redis"] = f"fail: {e}"
+            ok = False
+        try:
+            async with app_.state.session_factory() as db:
+                await db.execute(text("SELECT 1"))
+            checks["db"] = "ok"
+        except Exception as e:
+            checks["db"] = f"fail: {e}"
+            ok = False
+        checks["queue_backlog"] = await app_.state.task_queue.backlog()
+        if not ok:
+            from starlette.responses import JSONResponse
+
+            return JSONResponse(status_code=503, content={"ready": False, "checks": checks})
+        return {"ready": True, "checks": checks}
 
     @app_.get("/metrics")
     async def metrics_endpoint():
