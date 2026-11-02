@@ -127,3 +127,22 @@ class TaskRecord(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AuditLog(Base):
+    """管理面审计日志(P2 hardening,只追加):谁在什么时候对什么做了什么。
+
+    - actor 当前恒为 "admin"(token 单一主体);引入真实账号体系后换主体 ID;
+    - detail 只放非敏感摘要(如 key prefix,绝不放 raw key / 渠道密钥明文);
+    - 与业务变更同事务写入(admin 端点内),失败一起回滚 —— 审计不出现"改了但没记"。
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor: Mapped[str] = mapped_column(String(64), default="admin")
+    action: Mapped[str] = mapped_column(String(64), index=True)  # tenant.create / key.issue / ...
+    target_type: Mapped[str] = mapped_column(String(32))
+    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

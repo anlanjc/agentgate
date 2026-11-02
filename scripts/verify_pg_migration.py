@@ -44,7 +44,7 @@ def main() -> None:
     # 验表(psql 同步;默认对齐输出无分隔符,按行 strip 匹配表名)
     out = db.psql("select tablename from pg_tables where schemaname='public' order by 1;")
     tables = {line.strip() for line in out.splitlines()}
-    expected = {"channels", "task_records", "tenants", "usage_records", "virtual_keys"}
+    expected = {"audit_logs", "channels", "task_records", "tenants", "usage_records", "virtual_keys"}
     missing = expected - tables
     assert not missing, f"缺表: {missing}(实际输出: {sorted(tables)[:12]})"
     print(f"[3] PG 表验证通过: {sorted(expected)}")

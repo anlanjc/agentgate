@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.auth.keys import generate_key, invalidate
-from app.db.models import Tenant, UsageRecord, VirtualKey
+from app.db.models import AuditLog, Tenant, UsageRecord, VirtualKey
 from app.errors import GatewayError
 
 router = APIRouter(prefix="/admin")
@@ -51,12 +51,25 @@ class KeyCreate(BaseModel):
     model_whitelist: list[str] | None = None
 
 
+def _audit(db, action: str, target_type: str, target_id: str, detail: dict | None = None) -> None:
+    """审计行与业务变更同事务(add 不提交,由端点现有 commit 一并落库)。"""
+    from app.db.models import AuditLog
+
+    db.add(
+        AuditLog(
+            actor="admin", action=action, target_type=target_type,
+            target_id=target_id[:64], detail=detail,
+        )
+    )
+
+
 @router.post("/tenants")
 async def create_tenant(body: TenantCreate, request: Request) -> dict:
     _require_admin(request)
     async with request.app.state.session_factory() as db:
         tenant = Tenant(id=uuid.uuid4().hex[:32], name=body.name, webhook_url=body.webhook_url)
         db.add(tenant)
+        _audit(db, "tenant.create", "tenant", tenant.id, {"name": body.name})
         try:
             await db.commit()
         except IntegrityError:
@@ -87,6 +100,8 @@ async def create_key(tenant_id: str, body: KeyCreate, request: Request) -> dict:
             budget_tokens=body.budget_tokens,
         )
         db.add(vk)
+        # detail 只放 prefix:raw key 绝不入审计(泄露审计=泄露可用 key)
+        _audit(db, "key.issue", "virtual_key", vk.id, {"tenant_id": tenant_id, "prefix": prefix})
         await db.commit()
         return {"key_id": vk.id, "key": raw, "prefix": prefix}  # raw 仅此一次
 
@@ -100,6 +115,7 @@ async def deactivate_key(key_id: str, request: Request) -> dict:
         if vk is None:
             raise GatewayError(404, "key not found", "invalid_request_error", "key_not_found")
         vk.is_active = False
+        _audit(db, "key.revoke", "virtual_key", key_id, {"prefix": vk.key_prefix})
         await db.commit()
         await invalidate(request.app.state.redis, vk.key_hash)  # 主动失效缓存:吊销立即生效
         return {"key_id": key_id, "is_active": False}
@@ -220,6 +236,8 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
                     body.base_url, stored_key, body.models, True,
                 )
                 ch.connect_timeout, ch.read_timeout = body.connect_timeout, body.read_timeout
+            # 审计 detail 不放 api_key(密文也不放):渠道凭据不入任何日志/审计面
+            _audit(db, "channel.register", "channel", body.name, {"models": body.models})
             await db.commit()
         except IntegrityError:
             await db.rollback()
@@ -242,7 +260,33 @@ async def purge_response_cache(request: Request) -> dict:
     async for key in request.app.state.redis.scan_iter(match="resp:*", count=500):
         await request.app.state.redis.delete(key)
         removed += 1
+    async with request.app.state.session_factory() as db:
+        _audit(db, "cache.purge", "response_cache", "*", {"removed": removed})
+        await db.commit()
     return {"purged": removed}
+
+
+@router.get("/audit")
+async def list_audit(request: Request, limit: int = 100) -> dict:
+    """管理面审计流水(只追加):谁/何时/对什么/做了什么,排障与合规的第一手证据。"""
+    _require_admin(request)
+    limit = max(1, min(limit, 500))
+    async with request.app.state.session_factory() as db:
+        rows = (
+            await db.execute(
+                select(AuditLog).order_by(AuditLog.id.desc()).limit(limit)
+            )
+        ).scalars().all()
+    return {
+        "entries": [
+            {
+                "id": r.id, "actor": r.actor, "action": r.action,
+                "target_type": r.target_type, "target_id": r.target_id,
+                "detail": r.detail, "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.get("/channels")
