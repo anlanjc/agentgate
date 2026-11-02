@@ -1,0 +1,64 @@
+# agentgate SLO 告警规则(P3-17)
+# 分级:P1(页)按错误率与全渠道故障;P2(工单)按延迟/积压/死信趋势。
+# 阈值是起点不是承诺:真实流量回来后按基线校准(上线前数字是占位,PRODUCTION_GAP 纪律)。
+
+groups:
+  - name: agentgate-slo
+    rules:
+      # P1:5 分钟错误率 > 5%(按渠道维度可下钻;全渠道耗尽=503 会体现在 5xx)
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(agentgate_requests_total{status_class="5xx"}[5m]))
+            / clamp_min(sum(rate(agentgate_requests_total[5m])), 0.001) > 0.05
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "网关 5xx 错误率超过 5%(持续 2m)"
+          runbook: "先看 /admin/web 渠道健康:全冷却?上游大面积故障?再查渠道冷却事件日志"
+
+      # P1:全部渠道进入冷却(容量归零前兆;gauge 0/1,sum=count 即全冷)
+      - alert: AllChannelsCooling
+        expr: sum(agentgate_channel_cooling) >= count(agentgate_channel_cooling) and count(agentgate_channel_cooling) > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "所有渠道冷却中 —— 新请求将收到 503 no_channel_available"
+
+      # P2:流式 TTFT P99 > 5s(慢在上游还是网关:对比 REQUEST_LATENCY 差值)
+      - alert: StreamingTTFTP99High
+        expr: histogram_quantile(0.99, sum(rate(agentgate_ttft_ms_bucket[5m])) by (le)) > 5000
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "流式 TTFT P99 超 5s —— 上游变慢或渠道选择劣化(EMA 路由查因)"
+
+      # P2:任务队列积压(落库/回调跟不上;XACK 后 XDEL 的真实待处理量)
+      - alert: TaskQueueBacklogHigh
+        expr: max(agentgate_usage_queue_depth) > 100
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Streams 积压 > 100(持续 5m)—— 消费者跟不上或 Redis/DB 抖动"
+
+      # P1:死信 > 0(任务三次重试失败,账本/webhook 已漏,需人工介入 DLQ)
+      - alert: DeadLetterTasks
+        expr: increase(agentgate_tasks_dead_total[10m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "出现死信任务 —— 查 gate:tasks:dlq 与 webhook 目标可达性"
+
+      # P2:吞吐骤降(与自身 1h 前对比,检出静默故障)
+      - alert: ThroughputDrop
+        expr: |
+          sum(rate(agentgate_requests_total[10m]))
+            < 0.3 * sum(rate(agentgate_requests_total[10m] offset 1h))
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "吞吐较 1h 前下降 70%+ —— 静默故障或流量结构变化"

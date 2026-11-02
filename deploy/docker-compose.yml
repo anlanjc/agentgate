@@ -17,11 +17,17 @@ services:
       # 不提供默认值:未设置时 compose 直接报错,杜绝 change-me 上公网。
       AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:?set a strong AGENTGATE_ADMIN_TOKEN first}
       AGENTGATE_LLM_TRUST_ENV: "false"
+      # 分布式追踪(M6,默认关;compose 拓扑里接到 Jaeger,P3-17)
+      AGENTGATE_OTEL_ENABLED: "true"
+      AGENTGATE_OTEL_EXPORTER: otlp
+      AGENTGATE_OTEL_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8100/health')"]
       interval: 10s
@@ -59,6 +65,15 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro  # SLO 告警规则(P3-17)
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "16686:16686"  # UI:查询 gateway.upstream span(渠道/模型/状态逐次尝试)
+      - "4317:4317"    # OTLP gRPC(网关 exporter 目标)
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
 
   grafana:
     image: grafana/grafana:latest
