@@ -30,6 +30,7 @@ async def load_channels_from_db(app_: FastAPI) -> int:
     from sqlalchemy import select
 
     from app.db.models import Channel
+    from app.security.crypto import InvalidToken, decrypt_secret
 
     router = app_.state.channel_router
     settings = app_.state.settings
@@ -39,8 +40,14 @@ async def load_channels_from_db(app_: FastAPI) -> int:
     for ch in rows:
         if ch.name in router.names:
             continue
+        try:
+            api_key = decrypt_secret(ch.api_key)
+        except InvalidToken as exc:
+            # 主密钥轮换/密文损坏:该渠道不可用是事实,宁可路由失败(冷却)也不用错密钥打上游。
+            logger.error("channel_secret_decrypt_failed", channel=ch.name, error=str(exc))
+            continue
         client = UpstreamClient(
-            ch.base_url, ch.api_key,
+            ch.base_url, api_key,
             connect_timeout=ch.connect_timeout,
             read_timeout=ch.read_timeout,
             trust_env=settings.llm_trust_env,
@@ -59,6 +66,14 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+
+    # 渠道密钥静态加密(P2 hardening):主密钥就绪则写入即密文;未配置=明文口径,
+    # dev 诚实告警(prod 由 Settings 校验器拒绝启动)。
+    from app.security.crypto import init_cipher
+
+    init_cipher(settings.channel_enc_key or None)
+    if not settings.channel_enc_key:
+        logger.warning("channel_secrets_stored_plaintext_dev_only")
 
     # state 同步初始化(引擎/客户端均为惰性建连,不触碰网络):
     # ASGITransport 测试路径不跑 lifespan,state 必须在工厂内就绪;lifespan 只负责优雅关闭。

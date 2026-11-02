@@ -196,6 +196,11 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     router.register(body.name, client, body.models)
 
     # 持久化(ADR-005):重启恢复;超时参数也必须入库,否则重启后静默回默认值。
+    # 密钥静态加密(P2 hardening):入库永远是密文(无主密钥的 dev 口径原样),
+    # 运行时客户端持有的仍是调用方传入的明文 —— 明文不落库。
+    from app.security.crypto import encrypt_secret
+
+    stored_key = encrypt_secret(body.api_key)
     async with request.app.state.session_factory() as db:
         from sqlalchemy import select
 
@@ -206,13 +211,13 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
                 db.add(
                     Channel(
                         id=_uuid.uuid4().hex[:32], name=body.name, base_url=body.base_url,
-                        api_key=body.api_key, models=body.models,
+                        api_key=stored_key, models=body.models,
                         connect_timeout=body.connect_timeout, read_timeout=body.read_timeout,
                     )
                 )
             else:
                 ch.base_url, ch.api_key, ch.models, ch.is_active = (
-                    body.base_url, body.api_key, body.models, True,
+                    body.base_url, stored_key, body.models, True,
                 )
                 ch.connect_timeout, ch.read_timeout = body.connect_timeout, body.read_timeout
             await db.commit()

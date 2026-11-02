@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     auth_enabled: bool = True
     admin_token: str = ""  # 为空时 admin API 不设防(仅限本机开发)
 
+    # 渠道密钥静态加密主密钥(Fernet;为空=明文口径仅限 dev,prod 强制要求)
+    channel_enc_key: str = ""
+
     # 鉴权开启时,流式请求强制向上游要 usage(否则客户端不传 include_usage 时账本记 0 token)
     force_stream_usage: bool = True
 
@@ -65,6 +68,11 @@ class Settings(BaseSettings):
             )
         if not self.auth_enabled:
             raise ValueError("AGENTGATE_ENVIRONMENT=prod 时禁止关闭 auth_enabled")
+        if not self.channel_enc_key:
+            raise ValueError(
+                "AGENTGATE_ENVIRONMENT=prod 时必须设置 AGENTGATE_CHANNEL_ENC_KEY"
+                "(渠道密钥静态加密主密钥,cryptography.fernet.Fernet.generate_key() 生成)"
+            )
         return self
 
 
