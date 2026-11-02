@@ -69,7 +69,10 @@ def create_app(
 
     # 渠道密钥静态加密(P2 hardening):主密钥就绪则写入即密文;未配置=明文口径,
     # dev 诚实告警(prod 由 Settings 校验器拒绝启动)。
+    from app import billing
     from app.security.crypto import init_cipher
+
+    billing.reload_prices()  # 价目表快照(P4;consumer 进程经此共享,改价需重启)
 
     init_cipher(settings.channel_enc_key or None)
     if not settings.channel_enc_key:

@@ -59,6 +59,13 @@ async def write_usage(payload: dict, session_factory) -> dict:
     record = {k: v for k, v in payload.items() if k in UsageRecord.__table__.columns}
     if record.get("key_id") == "anonymous":
         record["key_id"] = None
+    # 成本(P4):账本写入点计算(所有路径同源);未登记价格的模型 cost=None
+    from app.billing import compute_cost
+
+    record["cost"] = compute_cost(
+        record.get("model", ""), int(record.get("prompt_tokens") or 0),
+        int(record.get("completion_tokens") or 0),
+    )
     async with session_factory() as db:
         exists = await db.execute(
             select(UsageRecord.id).where(

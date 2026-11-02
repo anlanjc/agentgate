@@ -89,6 +89,8 @@ class UsageRecord(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[int] = mapped_column(Integer, default=200)  # 上游状态码或网关映射码
     channel: Mapped[str] = mapped_column(String(64), default="")  # 命中的上游渠道(可观测)
+    # 金额(元;P4):模型单价 × token,账本写入时计算;未登记价格的模型记 NULL(不猜价)
+    cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 

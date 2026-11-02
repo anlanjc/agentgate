@@ -8,7 +8,7 @@ import secrets
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -200,6 +200,87 @@ async def tenant_usage(
             "total_tokens": int(tokens_n),
             "by_model": {m: {"requests": int(c), "total_tokens": int(t)} for m, c, t in by_model.all()},
         }
+
+
+@router.get("/tenants/{tenant_id}/billing")
+async def tenant_billing(
+    tenant_id: str,
+    request: Request,
+    start: str | None = None,
+    end: str | None = None,
+    format: str = "json",
+) -> Response:
+    """租户账单(P4):金额汇总(按模型)+ 明细 CSV 导出。
+
+    cost 来自账本写入时点计算(单价 × token);未登记价格的模型 cost=NULL,
+    汇总里以 unpriced_tokens 单列 —— 不把没登记的当成 0 元混进总额。
+    """
+    _require_admin(request)
+    start_dt = _parse_dt(start, "start")
+    end_dt = _parse_dt(end, "end")
+    if start_dt and end_dt and start_dt >= end_dt:
+        raise GatewayError(400, "start must be before end", "invalid_request_error", "invalid_time_range")
+
+    filters = [UsageRecord.tenant_id == tenant_id]
+    if start_dt:
+        filters.append(UsageRecord.created_at >= start_dt)
+    if end_dt:
+        filters.append(UsageRecord.created_at < end_dt)
+
+    async with request.app.state.session_factory() as db:
+        rows = (
+            await db.execute(
+                select(
+                    UsageRecord.request_id, UsageRecord.model, UsageRecord.channel,
+                    UsageRecord.prompt_tokens, UsageRecord.completion_tokens,
+                    UsageRecord.total_tokens, UsageRecord.cost, UsageRecord.status,
+                    UsageRecord.created_at,
+                )
+                .where(*filters)
+                .order_by(UsageRecord.id)
+                .limit(10_000)
+            )
+        ).all()
+
+    if format == "csv":
+        import csv
+        import io
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["request_id", "model", "channel", "prompt_tokens",
+                    "completion_tokens", "total_tokens", "cost_cny", "status", "created_at"])
+        for r in rows:
+            w.writerow([r.request_id, r.model, r.channel, r.prompt_tokens,
+                        r.completion_tokens, r.total_tokens,
+                        "" if r.cost is None else r.cost, r.status,
+                        r.created_at.isoformat()])
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="billing-{tenant_id}.csv"'},
+        )
+
+    total_cost = sum(r.cost for r in rows if r.cost is not None)
+    unpriced = sum(r.total_tokens for r in rows if r.cost is None)
+    by_model: dict[str, dict] = {}
+    for r in rows:
+        entry = by_model.setdefault(
+            r.model, {"requests": 0, "total_tokens": 0, "cost": 0.0}
+        )
+        entry["requests"] += 1
+        entry["total_tokens"] += r.total_tokens
+        if r.cost is not None:
+            entry["cost"] = round(entry["cost"] + r.cost, 8)
+    return {
+        "tenant_id": tenant_id,
+        "start": start_dt.isoformat() if start_dt else None,
+        "end": end_dt.isoformat() if end_dt else None,
+        "requests": len(rows),
+        "total_cost_cny": round(total_cost, 8),
+        "unpriced_tokens": unpriced,
+        "by_model": by_model,
+    }
 
 
 class ChannelCreate(BaseModel):
