@@ -2,7 +2,7 @@
 
 方法论延续 load_test.py(附加开销取 c=1 差值;容量取 c=N 吞吐):
 - mock 上游独立进程(uvicorn);网关以 `uvicorn app.api.main:app --workers N` 真子进程起;
-- 每个 worker 是独立进程(GIL 隔离),共享 Redis 状态(限流/路由)与 SQLite 账本(单写者 per 进程);
+- 每个 worker 是独立进程(GIL 隔离),共享 Redis 状态(限流/路由/鉴权缓存)与 SQLite 账本(经 Streams 持久队列落库,ADR-004);
 - 诚实边界:本机 Windows + aiohttp 单进程客户端,绝对数字受客户端上限约束,看相对扩展比。
 
 运行:.venv/Scripts/python scripts/load_workers.py [--requests 1500] [--concurrency 50] [--out evidence/load_workers.md]
@@ -15,6 +15,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -100,8 +101,10 @@ async def main() -> None:
     print(f"[boot] mock upstream :{mock_port}")
 
     # 1) 种子:租户 + key(经一次性单进程引导,写共享 SQLite/Redis)
-    if os.path.exists("load_workers.db"):
-        os.remove("load_workers.db")
+    # DB 用一次性临时路径:固定文件名会被上次运行的孤儿进程锁死(Windows 文件锁坑,
+    # PermissionError 直接炸掉整个压测);临时目录随运行结束弃置,根除该故障面。
+    run_dir = tempfile.mkdtemp(prefix="ag_workers_")
+    db_path = os.path.join(run_dir, "workers.db")
 
     from app.api.main import create_app
     from app.auth.keys import generate_key
@@ -116,7 +119,7 @@ async def main() -> None:
         upstream_base_url=f"http://127.0.0.1:{mock_port}/v1",
         upstream_api_key="sk-w",
         models=["mock-model"],
-        db_url="sqlite+aiosqlite:///./load_workers.db",
+        db_url=f"sqlite+aiosqlite:///{db_path}",
         redis_url="redis://127.0.0.1:6379/5",
         auth_enabled=True,
         log_level="WARNING",
@@ -147,7 +150,7 @@ async def main() -> None:
             "AGENTGATE_UPSTREAM_BASE_URL": f"http://127.0.0.1:{mock_port}/v1",
             "AGENTGATE_UPSTREAM_API_KEY": "sk-w",
             "AGENTGATE_MODELS": '["mock-model"]',
-            "AGENTGATE_DB_URL": "sqlite+aiosqlite:///./load_workers.db",
+            "AGENTGATE_DB_URL": f"sqlite+aiosqlite:///{db_path}",
             "AGENTGATE_REDIS_URL": "redis://127.0.0.1:6379/5",
             "AGENTGATE_AUTH_ENABLED": "true",
             "AGENTGATE_LOG_LEVEL": "WARNING",
@@ -214,7 +217,7 @@ async def main() -> None:
         "",
         "## 口径声明",
         "- 多进程 GIL 隔离,共享状态全在 Redis(限流/路由/鉴权缓存)——多副本一致性的设计被本压测直接验证;",
-        "- 账本为每进程单写者写共享 SQLite(PG 下无此顾虑);扩展比非线性的部分来自本机 CPU 与客户端上限;",
+        "- 账本经 Streams 持久队列落库到共享 SQLite(多进程写经消费者串行化,PG 下无此顾虑);扩展比非线性的部分来自本机 CPU 与客户端上限;",
         "- 生产形态即此(uvicorn --workers N / k8s 多副本)。",
     ]
     report = "\n".join(lines)

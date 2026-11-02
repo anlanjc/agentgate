@@ -18,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -79,6 +80,11 @@ async def main() -> None:
     print(f"[1] agent-a :{port_a} · agent-b :{port_b} 已启动")
 
     # 2) 网关(子进程,真 HTTP)
+    # DB 用一次性路径:固定文件名会被上次运行的孤儿进程锁死(Windows 文件锁坑),
+    # 且 ADR-005 启动恢复会把上次注册的死渠道(旧端口)带回来污染路由 —— 一次性
+    # DB 两个问题一起根除。
+    run_dir = tempfile.mkdtemp(prefix="ag_eco_")
+    gw_db = os.path.join(run_dir, "eco_gw.db").replace("\\", "/")
     gw_port = _free_port()
     gw_code = (
         "import asyncio, sys, os, uvicorn\n"
@@ -89,14 +95,18 @@ async def main() -> None:
         "from app.db.session import init_db\n"
         "s = Settings(upstream_name='default', upstream_base_url='http://mock/v1', upstream_api_key='k',"
         " models=['agent-a','agent-b'],"
-        f" db_url='sqlite+aiosqlite:///{ROOT}/demo_gw.db',"
+        f" db_url='sqlite+aiosqlite:///{gw_db}',"
         " redis_url='redis://127.0.0.1:6379/4', auth_enabled=False, log_level='WARNING')\n"
         "app = create_app(settings=s)\n"
-        "@app.on_event('startup')\n"
-        "async def _init():\n"
-        "    await init_db(app.state.engine)\n"
+        "# 先建表再起服务:lifespan 的渠道恢复(ADR-005)跑在建表之前会撞 no such table\n"
+        "asyncio.run(init_db(app.state.engine))\n"
         "uvicorn.run(app, host='127.0.0.1', port=" + str(gw_port) + ", log_level='error', access_log=False)\n"
     )
+    import redis.asyncio as _aredis
+
+    _r4 = _aredis.from_url("redis://127.0.0.1:6379/4", decode_responses=True, protocol=2)
+    await _r4.flushdb()  # 上次演练的限流/冷却/渠道状态残留会污染本次
+    await _r4.aclose()
     gw = subprocess.Popen(
         [sys.executable, "-c", gw_code], cwd=str(ROOT),
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
@@ -110,7 +120,9 @@ async def main() -> None:
             for name, port in (("agent-a", port_a), ("agent-b", port_b)):
                 r = await c.post(
                     "/admin/channels",
-                    json={"name": name, "base_url": f"http://127.0.0.1:{port}/v1", "models": [name]},
+                    # 两渠道声明同一模型池:failover 的真实前提是"同模型多渠道",
+                    # hardening 后路由按 model 过滤(P2 语义收紧),单渠道独占模型的死法是设计行为
+                    json={"name": name, "base_url": f"http://127.0.0.1:{port}/v1", "models": ["agent-a", "agent-b"]},
                 )
                 assert r.status_code == 200, r.text
             print("[3] agent-a / agent-b 已注册为网关渠道")
@@ -151,9 +163,10 @@ async def main() -> None:
             with contextlib.suppress(Exception):
                 p.kill()
                 p.wait(timeout=5)
-        for f in ("demo_gw.db",):
-            with contextlib.suppress(Exception):
-                os.remove(f)
+        with contextlib.suppress(Exception):
+            import shutil
+
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
