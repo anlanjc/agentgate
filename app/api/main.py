@@ -123,6 +123,15 @@ def create_app(
         page = Path(__file__).resolve().parents[2] / "app" / "web" / "playground.html"
         return FileResponse(page, media_type="text/html")
 
+    @app_.get("/web-static/style.css")
+    async def web_style():
+        from pathlib import Path
+
+        from starlette.responses import FileResponse
+
+        page = Path(__file__).resolve().parents[2] / "app" / "web" / "style.css"
+        return FileResponse(page, media_type="text/css")
+
     return app_
 
 

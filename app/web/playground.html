@@ -3,91 +3,92 @@
 <head>
 <meta charset="utf-8">
 <title>agentgate Playground</title>
+<link rel="stylesheet" href="/web-static/style.css">
 <style>
-  :root { --bg:#0d1117; --card:#161b22; --line:#21262d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { background:var(--bg); color:var(--fg); font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; padding:24px; }
-  h1 { font-size:20px; } h1 span { color:var(--acc); }
-  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
-  .wrap { display:grid; grid-template-columns:380px 1fr; gap:16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
-  .card h2 { font-size:13px; color:var(--acc); margin-bottom:8px; }
-  label { font-size:12px; color:var(--dim); display:block; margin:8px 0 2px; }
-  input, textarea, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; font-family:inherit; }
-  textarea { min-height:64px; resize:vertical; }
-  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px; margin-top:10px; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .row { display:flex; gap:8px; align-items:center; }
-  .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin:10px 0; }
-  .metric { background:#0d1117; border:1px solid var(--line); border-radius:6px; padding:8px; }
-  .metric b { display:block; font-size:16px; color:var(--acc); }
-  .metric span { font-size:11px; color:var(--dim); }
-  #out { background:#0d1117; border:1px solid var(--line); border-radius:6px; padding:12px; min-height:220px; white-space:pre-wrap; font-family:Consolas,monospace; font-size:13px; }
-  .cursor { display:inline-block; width:8px; height:14px; background:var(--acc); animation:blink 1s infinite; vertical-align:text-bottom; }
-  @keyframes blink { 50% { opacity:0; } }
-  .hist { font-size:12px; color:var(--dim); margin-top:8px; }
-  .pill { padding:1px 8px; border-radius:10px; font-size:11px; background:rgba(88,166,255,.15); color:var(--acc); display:inline-block; margin-left:6px; }
+  .wrap { display: grid; grid-template-columns: 370px 1fr; gap: 16px; }
+  #out { min-height: 380px; max-height: 560px; overflow-y: auto; }
+  .hist-item { padding: 6px 10px; border-top: 1px solid var(--line-soft); display: flex; justify-content: space-between; gap: 8px; }
+  .hist-item:first-child { border-top: 0; }
+  kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--line-soft); border-radius: 4px; padding: 0 5px; color: var(--dim); }
 </style>
 </head>
 <body>
-  <h1>agentgate <span>Playground</span></h1>
-  <div class="sub">穿过全链路试玩:鉴权 → Lua 准入 → 渠道调度 → SSE 流式 → 异步记账。所有头部与延迟都是实测。</div>
+  <div class="top">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M12 2L3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7l-9-5z"/><path d="M8 12h8M8 9v6M16 9v6" stroke-opacity=".55"/></svg></div>
+    <h1>agentgate <span>Playground</span></h1>
+    <span class="badge" id="ver"></span>
+  </div>
+  <div class="sub"><span class="dot"></span>穿过全链路试玩:鉴权 → Lua 准入 → 渠道调度 → SSE 流式 → 异步记账 · 所有头部与延迟均为实测 · <kbd>Ctrl+Enter</kbd> 发送</div>
+
   <div class="wrap">
     <div>
       <div class="card">
         <h2>请求参数</h2>
-        <label>API Key(ag- 开头;可在管理台签发)</label>
-        <input id="key" placeholder="ag-...">
+        <label>API Key(管理台签发,ag- 开头)</label>
+        <input id="key" class="mono" placeholder="ag-...">
         <label>模型</label>
         <select id="model"></select>
         <label>Question</label>
         <textarea id="q">用一句话介绍你自己</textarea>
-        <div class="row">
-          <label style="margin:10px 0 0"><input type="checkbox" id="stream" checked> 流式(SSE)</label>
-          <label style="margin:10px 0 0 12px"><input type="checkbox" id="usage"> 携带 include_usage</label>
+        <div class="row" style="margin-top:10px">
+          <label style="margin:0"><input type="checkbox" id="stream" checked> 流式(SSE)</label>
+          <label style="margin:0 0 0 14px"><input type="checkbox" id="usage" checked> include_usage</label>
         </div>
-        <button id="send" onclick="send()">发送</button>
-        <button style="background:transparent;border:1px solid var(--line)" onclick="loadModels()">刷新模型</button>
+        <div class="row" style="margin-top:12px">
+          <button id="send" onclick="send()">发送</button>
+          <button class="ghost" onclick="loadModels()">刷新模型</button>
+        </div>
       </div>
-      <div class="card" style="margin-top:12px">
+      <div class="card" style="margin-top:14px">
         <h2>实测指标</h2>
-        <div class="metrics">
-          <div class="metric"><b id="mTTFT">—</b><span>TTFT(ms)</span></div>
-          <div class="metric"><b id="mTotal">—</b><span>总延迟(ms)</span></div>
-          <div class="metric"><b id="mChan">—</b><span>渠道</span></div>
+        <div class="metrics" style="grid-template-columns:1fr 1fr">
+          <div class="metric"><b id="mTTFT">—</b><span>TTFT 首token (ms)</span></div>
+          <div class="metric"><b id="mTotal">—</b><span>总延迟 (ms)</span></div>
+          <div class="metric"><b id="mChan">—</b><span>命中渠道</span></div>
           <div class="metric"><b id="mCache">—</b><span>缓存</span></div>
         </div>
-        <div class="metric" style="margin-top:8px"><b id="mTok" style="font-size:13px">—</b><span>usage(prompt/completion/total)</span></div>
+        <div class="metric"><b id="mTok" style="font-size:13px">—</b><span>usage prompt / completion / total</span></div>
       </div>
     </div>
+
     <div class="card">
-      <h2>输出 <span id="reqId" class="pill"></span></h2>
-      <div id="out">点击「发送」,观察逐字流式与右侧指标。</div>
-      <div id="hist" class="hist"></div>
+      <h2>对话 <span id="reqId" class="pill acc" style="display:none"></span></h2>
+      <div id="out"></div>
+      <div id="hist" class="hist-item" style="border:0"></div>
     </div>
   </div>
+  <div id="toast"></div>
 
 <script>
 const $ = s => document.querySelector(s);
+const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; setTimeout(()=>t.style.display='none',2500); };
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 let history = [];
 
 async function loadModels(){
   try {
-    const r = await fetch('/v1/models');
-    const d = await r.json();
+    const d = await (await fetch('/v1/models')).json();
     $('#model').innerHTML = d.data.map(m => `<option>${m.id}</option>`).join('');
   } catch(e) { $('#model').innerHTML = '<option>(服务未就绪)</option>'; }
 }
+const setM = (id, v, cls) => { const el=$(id); el.textContent=v; el.className = cls||''; };
 
-function setMetric(id, v){ $(id).textContent = v; }
+function bubble(cls, html){
+  const b = document.createElement('div');
+  b.className = 'bubble ' + cls; b.innerHTML = html;
+  $('#out').appendChild(b); $('#out').scrollTop = $('#out').scrollHeight;
+  return b;
+}
 
 async function send(){
   const key = $('#key').value.trim();
-  if (!key) { $('#out').textContent = '请先粘贴 API key(管理台签发)'; return; }
+  if (!key) { bubble('ai', '请先粘贴 API key(到管理台签发一把)'); return; }
   const stream = $('#stream').checked;
   $('#send').disabled = true;
-  $('#out').textContent = '';
-  setMetric('#mTTFT','—'); setMetric('#mTotal','—'); setMetric('#mChan','—'); setMetric('#mCache','—'); setMetric('#mTok','—');
+  setM('#mTTFT','—'); setM('#mTotal','—'); setM('#mChan','—'); setM('#mCache','—'); setM('#mTok','—');
+  $('#reqId').style.display = 'none';
+  bubble('user', esc($('#q').value));
+  const ai = bubble('ai', '<span class="cursor"></span>');
   const t0 = performance.now();
   let ttft = null, out = '';
 
@@ -96,67 +97,87 @@ async function send(){
 
   try {
     const resp = await fetch('/v1/chat/completions', {
-      method: 'POST', headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    setMetric('#mChan', resp.headers.get('x-upstream-channel') || '—');
-    setMetric('#mCache', resp.headers.get('x-cache') || 'BYPASS');
-    $('#reqId').textContent = 'request_id: ' + (resp.headers.get('x-request-id') || '');
+    setM('#mChan', resp.headers.get('x-upstream-channel') || '—');
+    const cache = resp.headers.get('x-cache') || 'BYPASS';
+    setM('#mCache', cache, cache === 'HIT' || cache === 'SEMANTIC_HIT' ? 'good' : '');
+    if (resp.headers.get('x-request-id')) {
+      $('#reqId').textContent = resp.headers.get('x-request-id');
+      $('#reqId').style.display = 'inline-block';
+    }
+    if (!resp.ok && !(stream && resp.status < 500)) {
+      let msg = 'HTTP ' + resp.status;
+      try { msg = (await resp.json()).error?.message || msg; } catch(_) {}
+      ai.innerHTML = '<span style="color:var(--bad)">' + esc(msg) + '</span>';
+      history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), tag: resp.status, bad: true });
+      renderHist(); $('#send').disabled = false; return;
+    }
 
     if (!stream) {
       const d = await resp.json();
-      if (d.error) { $('#out').textContent = '错误: ' + JSON.stringify(d.error); return; }
-      out = d.choices[0].message.content || '';
-      $('#out').textContent = out;
-      setMetric('#mTok', `${d.usage?.prompt_tokens??0}/${d.usage?.completion_tokens??0}/${d.usage?.total_tokens??0}`);
-      setMetric('#mTotal', (performance.now()-t0).toFixed(0));
-      history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), cache: resp.headers.get('x-cache')||'BYPASS' });
-      renderHist();
-      return;
-    }
-
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', usage = null;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      if (ttft === null && buf.includes('data:')) { ttft = performance.now() - t0; setMetric('#mTTFT', ttft.toFixed(0)); }
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        try {
-          const evt = JSON.parse(payload);
-          const delta = evt.choices?.[0]?.delta?.content;
-          if (delta) { out += delta; $('#out').innerHTML = escapeHtml(out) + '<span class="cursor"></span>'; }
-          if (evt.usage) usage = evt.usage;
-          if (evt.error) $('#out').textContent += '\n[stream error] ' + evt.message;
-        } catch(_) {}
+      out = d.choices?.[0]?.message?.content ?? JSON.stringify(d).slice(0, 400);
+      ai.textContent = out;
+      setM('#mTotal', (performance.now()-t0).toFixed(0));
+      const u = d.usage;
+      if (u) setM('#mTok', `${u.prompt_tokens??0}/${u.completion_tokens??0}/${u.total_tokens??0}`);
+    } else {
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '', usage = null;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        if (ttft === null && buf.includes('data:')) {
+          ttft = performance.now() - t0;
+          setM('#mTTFT', ttft.toFixed(0), ttft < 200 ? 'good' : ttft > 1500 ? 'slow' : '');
+        }
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const evt = JSON.parse(payload);
+            const delta = evt.choices?.[0]?.delta?.content;
+            if (delta) { out += delta; ai.innerHTML = esc(out) + '<span class="cursor"></span>'; $('#out').scrollTop = $('#out').scrollHeight; }
+            if (evt.usage) usage = evt.usage;
+            if (evt.error) out += '\n[stream error] ' + (evt.message || '');
+          } catch(_) {}
+        }
       }
+      ai.textContent = out;
+      setM('#mTotal', (performance.now()-t0).toFixed(0));
+      if (usage) setM('#mTok', `${usage.prompt_tokens??0}/${usage.completion_tokens??0}/${usage.total_tokens??0}`);
     }
-    $('#out').textContent = out;
-    setMetric('#mTotal', (performance.now()-t0).toFixed(0));
-    if (usage) setMetric('#mTok', `${usage.prompt_tokens??0}/${usage.completion_tokens??0}/${usage.total_tokens??0}`);
-    history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), ttft: ttft?.toFixed(0), cache: resp.headers.get('x-cache')||'BYPASS' });
-    if (history.length > 6) history.pop();
-    renderHist();
+    history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), ttft: ttft?.toFixed(0), tag: cache });
+    if (history.length > 7) history.pop();
   } catch (e) {
-    $('#out').textContent = '请求失败: ' + e.message;
+    ai.innerHTML = '<span style="color:var(--bad)">请求失败: ' + esc(e.message) + '</span>';
+    history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), tag: 'ERR', bad: true });
   } finally {
+    renderHist();
     $('#send').disabled = false;
   }
 }
 
-function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 function renderHist(){
-  $('#hist').innerHTML = '最近:' + history.map(h =>
-    `<div>${h.q.slice(0,18)}… · ${h.ms}ms${h.ttft? ' · TTFT '+h.ttft+'ms':''} · ${h.cache}</div>`).join('');
+  $('#hist').innerHTML = history.map(h =>
+    `<span>${esc(h.q.slice(0,16))}… <b class="mono">${h.ms}ms</b>${h.ttft? ' · TTFT '+h.ttft : ''} · <span class="pill ${h.bad?'cool':'acc'}">${h.tag}</span></span>`
+  ).join('<span class="muted"> · </span>');
 }
-loadModels();
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+});
+(async () => {
+  $('#ver').textContent = 'v' + (await (await fetch('/health')).json()).version;
+  await loadModels();
+})();
 </script>
 </body>
 </html>
