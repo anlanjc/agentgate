@@ -61,12 +61,16 @@ async def test_worker_processes_once_and_dedupes_redelivery(queue_env):
             break
         await asyncio.sleep(0.02)
     assert q.processed == 1 and received == [{"type": "t", "x": 1}]
+    # 已 ACK 的条目必须 XDEL:否则 XLEN/queue_backlog 会随历史无限增长
+    assert await redis.xlen(TASK_STREAM) == 0
+    assert await q.backlog() == 0
 
     # 模拟重复投递:直接再 XADD 一条同 task_id 消息
     await redis.xadd(TASK_STREAM, {"task_id": tid, "type": "t", "payload": json.dumps({"x": 1})})
     await asyncio.sleep(0.3)
     assert q.processed == 1  # 未重复执行
     assert received == [{"type": "t", "x": 1}]
+    assert await redis.xlen(TASK_STREAM) == 0  # 重复消息也被 ACK+DEL
 
     async with sf() as db:
         from sqlalchemy import select
