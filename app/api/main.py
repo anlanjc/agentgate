@@ -90,6 +90,11 @@ def create_app(
     )
     app_.state.ttft_samples = deque(maxlen=1000)  # M0 观测占位,M3 换 Prometheus 直方图
 
+    # M6:分布式追踪(默认关;span 粒度 = 每次上游尝试,属性含 tenant/model/channel/status)
+    from app.observability.tracing import setup_tracing
+
+    app_.state.tracer = setup_tracing(settings)
+
     # 语义缓存 embedder(默认关;有 EMBED key 用真 embedding,否则 HashEmbedder 词面口径)
     if settings.semantic_cache_enabled:
         if settings.embed_api_key:

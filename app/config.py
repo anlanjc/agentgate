@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     embed_api_key: str = ""
     embed_api_base: str = ""
 
+    # M6:分布式追踪(默认关;console 导出演示/otlp 生产,span 属性含 tenant/model/channel)
+    otel_enabled: bool = False
+    otel_exporter: str = "console"  # console | otlp
+    otel_otlp_endpoint: str = ""
+    otel_service_version: str = "0.1.0"
+
 
 @lru_cache
 def get_settings() -> Settings:

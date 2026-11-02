@@ -9,6 +9,7 @@
 import json
 import time
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 
 import httpx
 from fastapi import APIRouter, Request
@@ -45,6 +46,11 @@ def _gateway_error(status: int, message: str, err_type: str, code: str) -> JSONR
     return JSONResponse(status_code=status, content=body.model_dump())
 
 
+def r_tracer(state):
+    """路由层 tracer(未启用 OTel 时为 None,零开销路径)。"""
+    return getattr(state, "tracer", None)
+
+
 def _retry_after_s(resp: httpx.Response) -> int:
     try:
         return max(1, int(resp.headers.get("retry-after", "60")))
@@ -75,8 +81,17 @@ async def _dispatch_non_stream(
     for name in await r.candidates():
         client = r.client(name)
         t0 = time.perf_counter()
+        span_ctx = (
+            r_tracer(state).start_as_current_span(
+                "gateway.upstream", attributes={"gateway.channel": name, "gateway.model": payload.get("model", "")}
+            )
+            if r_tracer(state) else nullcontext()
+        )
         try:
-            resp = await client.chat_completion(payload, extra_headers=headers)
+            with span_ctx as span:
+                resp = await client.chat_completion(payload, extra_headers=headers)
+                if span:
+                    span.set_attribute("http.status_code", resp.status_code)
         except UPSTREAM_TRANSPORT_ERRORS as exc:
             await r.mark_failure(name)
             last_exc = exc
@@ -113,8 +128,17 @@ async def _dispatch_stream(
     for name in await r.candidates():
         client = r.client(name)
         t0 = time.perf_counter()
+        span_ctx = (
+            r_tracer(state).start_as_current_span(
+                "gateway.upstream_stream", attributes={"gateway.channel": name, "gateway.model": payload.get("model", "")}
+            )
+            if r_tracer(state) else nullcontext()
+        )
         try:
-            resp = await client.open_stream(payload, extra_headers=headers)
+            with span_ctx as span:
+                resp = await client.open_stream(payload, extra_headers=headers)
+                if span:
+                    span.set_attribute("http.status_code", resp.status_code)
         except UPSTREAM_TRANSPORT_ERRORS as exc:
             await r.mark_failure(name)
             last_exc = exc
