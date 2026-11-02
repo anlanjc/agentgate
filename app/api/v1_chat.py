@@ -401,6 +401,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 
     forward_headers = {k: v for k, v in request.headers.items() if k in _FORWARD_HEADERS}
 
+    # ---- Idempotency-Key(P2):重试安全,仅非流式(流式响应体不可重放,照常执行并留痕)----
+    idem_sk: str | None = None
+    raw_idem = (request.headers.get("idempotency-key") or "").strip()
+    if raw_idem:
+        if auth is None:
+            logger.warning("idempotency_requires_auth", request_id=request_id)
+        elif req.stream:
+            logger.warning("idempotency_skipped_for_stream", request_id=request_id)
+        else:
+            from app import idempotency
+
+            idem_sk = idempotency.storage_key(auth.tenant_id, auth.key_id, raw_idem)
+
     # ---- 流式:先调度渠道并开流(连接类异常发生在状态码提交前,可安全映射)----
     if req.stream:
         try:
@@ -498,6 +511,47 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     # 注意:传 make_record 本身(可调用),后台任务执行时才求值 —— 流式 usage 在流结束才可知
 
     # ---- 非流式 ----
+    # Idempotency-Key 优先于一切缓存:重放是客户端重试语义的最强承诺。
+    if idem_sk is not None:
+        from app import idempotency
+
+        stored = await idempotency.lookup(state.redis, idem_sk)
+        if stored is not None:
+            logger.info("idempotent_replay", request_id=request_id)
+            # 回放不重计费:账本记 channel=replay、token=0(上游零成本,预算/TPM 不动)
+            record = _record(auth, req.model, request_id, stored["status"], None, None, 0, channel="replay")
+            _record_metrics(auth, req.model, "replay", stored["status"], None)
+            return Response(
+                content=json.dumps(stored["body"], ensure_ascii=False).encode(),
+                status_code=stored["status"],
+                media_type="application/json",
+                headers={"x-idempotent-replay": "true", "x-upstream-channel": "replay"},
+                background=BackgroundTask(_account, request, auth, record),
+            )
+        if not await idempotency.acquire(state.redis, idem_sk):
+            raise GatewayError(
+                409, "request with this Idempotency-Key is still in flight",
+                "invalid_request_error", "idempotency_key_conflict", retry_after_s=2,
+            )
+    try:
+        return await _non_stream_core(
+            req, request, state, payload, request_id, request_t0, auth, idem_sk, forward_headers
+        )
+    finally:
+        if idem_sk is not None:
+            from app import idempotency
+
+            await idempotency.release(state.redis, idem_sk)
+
+
+async def _non_stream_core(
+    req: ChatCompletionRequest, request: Request, state, payload: dict,
+    request_id: str, request_t0: float, auth: AuthResult | None,
+    idem_sk: str | None, forward_headers: dict,
+) -> Response:
+    """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。"""
+    from app import idempotency
+
     # 响应缓存(默认关;只缓确定性请求,租户隔离键,语义见 app/cache/response.py)
     rkey = None
     exact_hit = False
@@ -605,6 +659,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     extra_headers = {"x-upstream-channel": channel or "exhausted"}
     if rkey is not None:
         extra_headers["x-cache"] = "MISS"
+    if idem_sk is not None and 200 <= resp.status_code < 300 and body_json is not None:
+        # 成功响应才进入重放库存(错误响应视为瞬态,重试重新执行);
+        # 释放锁由外层 finally 兜底,这里存完即释放,窗口最小化。
+        await idempotency.store(
+            state.redis, idem_sk, resp.status_code, body_json,
+            state.settings.idempotency_ttl_seconds,
+        )
+        await idempotency.release(state.redis, idem_sk)
     return Response(
         content=resp.content,
         status_code=resp.status_code,

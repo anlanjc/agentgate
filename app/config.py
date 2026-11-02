@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # 鉴权开启时,流式请求强制向上游要 usage(否则客户端不传 include_usage 时账本记 0 token)
     force_stream_usage: bool = True
 
+    # Idempotency-Key 响应重放留存时长(重试窗口;仅非流式,见 app/idempotency.py)
+    idempotency_ttl_seconds: int = 86_400
+
     # M5:精确响应缓存(默认关闭;只缓显式 temperature≤0 的非流式无工具请求,租户隔离见 app/cache/response.py)
     response_cache_enabled: bool = False
     response_cache_ttl: int = 300
