@@ -43,13 +43,38 @@ def pg_url() -> str | None:
         return
     external = os.environ.get("AGENTGATE_TEST_PG_URL")
     if external:
-        yield external.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return
-    import pgserver
+        url = external.replace("postgresql://", "postgresql+asyncpg://", 1)
+    else:
+        import pgserver
 
-    db = pgserver.get_server(os.path.join(os.path.dirname(__file__), "..", ".pgdata"))
-    uri = db.get_uri()  # postgresql://postgres:@host:port/postgres
-    yield uri.replace("postgresql://", "postgresql+asyncpg://", 1)
+        db = pgserver.get_server(os.path.join(os.path.dirname(__file__), "..", ".pgdata"))
+        uri = db.get_uri()  # postgresql://postgres:@host:port/postgres
+        url = uri.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # 本地 .pgdata 是持久库,create_all 只建缺失表、不改已有表 —— 模型演进后旧 schema
+    # 会跨 run 残留(published_at 类新列缺失,14 个假失败)。会话开始先按当前模型重建,
+    # 保证测试 schema 恒等于 models;迁移正确性由 verify_pg_migration.py 独立验证。
+    _rebuild_schema(url)
+    yield url
+
+
+def _rebuild_schema(url: str) -> None:
+    """drop_all + create_all 按当前模型重建 PG 测试库(自含事件循环,不污染测试 loop)。"""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.db.models import Base
+
+    async def run() -> None:
+        engine = create_async_engine(url)
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
 
 
 @pytest.fixture(autouse=True)
