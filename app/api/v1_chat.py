@@ -6,6 +6,7 @@
 - 渠道健康状态(EMA 延迟/冷却)存 Redis,多副本共享。
 """
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -78,12 +79,18 @@ async def _dispatch_non_stream(
     r: ChannelRouter = state.channel_router
     last_resp: httpx.Response | None = None
     last_exc: Exception | None = None
-    for name in await r.candidates():
+    model = payload.get("model", "")
+    for name in await r.candidates(model):
         client = r.client(name)
         t0 = time.perf_counter()
         span_ctx = (
             r_tracer(state).start_as_current_span(
-                "gateway.upstream", attributes={"gateway.channel": name, "gateway.model": payload.get("model", "")}
+                "gateway.upstream",
+                attributes={
+                    "gateway.channel": name,
+                    "gateway.model": model,
+                    "gateway.request_id": current_request_id(),
+                },
             )
             if r_tracer(state) else nullcontext()
         )
@@ -111,9 +118,9 @@ async def _dispatch_non_stream(
         return None, last_resp
     if last_exc is not None:
         raise last_exc
-    # 空候选 = 全部渠道冷却中:明确 503,而不是 raise None(TypeError)
+    # 空候选 = 无渠道支持该模型/全部冷却:明确 503,而不是 raise None(TypeError)
     raise GatewayError(
-        503, "all upstream channels cooling down", "bad_gateway",
+        503, f"no healthy upstream channel for model '{model}'", "bad_gateway",
         "no_channel_available", retry_after_s=5,
     )
 
@@ -125,12 +132,18 @@ async def _dispatch_stream(
     r: ChannelRouter = state.channel_router
     last_synthetic: httpx.Response | None = None
     last_exc: Exception | None = None
-    for name in await r.candidates():
+    model = payload.get("model", "")
+    for name in await r.candidates(model):
         client = r.client(name)
         t0 = time.perf_counter()
         span_ctx = (
             r_tracer(state).start_as_current_span(
-                "gateway.upstream_stream", attributes={"gateway.channel": name, "gateway.model": payload.get("model", "")}
+                "gateway.upstream_stream",
+                attributes={
+                    "gateway.channel": name,
+                    "gateway.model": model,
+                    "gateway.request_id": current_request_id(),
+                },
             )
             if r_tracer(state) else nullcontext()
         )
@@ -171,7 +184,7 @@ async def _dispatch_stream(
     if last_exc is not None:
         raise last_exc
     raise GatewayError(
-        503, "all upstream channels cooling down", "bad_gateway",
+        503, f"no healthy upstream channel for model '{model}'", "bad_gateway",
         "no_channel_available", retry_after_s=5,
     )
 
@@ -183,6 +196,16 @@ def _bearer(raw: str | None) -> str:
     if not raw or not raw.startswith("Bearer "):
         raise GatewayError(401, "missing bearer key", "invalid_request_error", "missing_api_key")
     return raw[len("Bearer "):].strip()
+
+
+def _last_user_question(req: ChatCompletionRequest) -> str:
+    return next(
+        (
+            m.content for m in reversed(req.messages)
+            if m.role == "user" and isinstance(m.content, str)
+        ),
+        "",
+    )
 
 
 async def _authenticate(request: Request, raw_key: str) -> AuthResult:
@@ -222,7 +245,8 @@ def _record(
     u = usage or {}
     return {
         "request_id": request_id,
-        "key_id": auth.key_id if auth else "anonymous",
+        # 纯代理模式没有 virtual key:key_id 为空,账本仍可写(PG 外键不再误伤)。
+        "key_id": auth.key_id if auth else None,
         "tenant_id": auth.tenant_id if auth else "anonymous",
         "model": model,
         "prompt_tokens": int(u.get("prompt_tokens", 0)),
@@ -235,6 +259,44 @@ def _record(
     }
 
 
+def _idempotency_key(kind: str, auth: AuthResult | None, request_id: str) -> str:
+    """账本/回调的幂等键必须带租户域。
+
+    request_id 允许客户端经 X-Request-Id 传入 —— 如果幂等键只有 request_id,
+    任何租户都能用一个重复 ID 让其他租户的账本被 UNIQUE 吞掉(计费 DoS)。
+    """
+    tenant = auth.tenant_id if auth else "anonymous"
+    return f"{kind}:{tenant}:{request_id}"
+
+
+def _record_metrics(
+    auth: AuthResult | None,
+    model: str,
+    channel: str,
+    status: int,
+    usage: dict | None,
+    *,
+    latency_ms: float | None = None,
+    ttft_ms: float | None = None,
+) -> None:
+    """指标只在响应真实结束后记一次(流式必须等 relay 结束,不能提前)。"""
+    tenant_label = auth.tenant_id if auth else "anonymous"
+    metrics.REQUESTS.labels(
+        tenant=tenant_label, channel=channel or "exhausted", status_class=metrics.status_class(status)
+    ).inc()
+    if latency_ms is not None:
+        metrics.REQUEST_LATENCY.labels(channel=channel or "exhausted").observe(latency_ms)
+    if ttft_ms is not None:
+        metrics.TTFT.labels(channel=channel or "exhausted").observe(ttft_ms)
+    if usage:
+        metrics.TOKENS.labels(tenant=tenant_label, model=model, kind="prompt").inc(
+            usage.get("prompt_tokens", 0)
+        )
+        metrics.TOKENS.labels(tenant=tenant_label, model=model, kind="completion").inc(
+            usage.get("completion_tokens", 0)
+        )
+
+
 async def _enqueue_error(state, auth, model: str, request_id: str, status: int) -> None:
     """错误路径的账本行:也走 Streams(错误低频,允许路径内小开销换全链一致)。"""
     from app.queue.streams import TaskQueue
@@ -245,56 +307,68 @@ async def _enqueue_error(state, auth, model: str, request_id: str, status: int) 
             await tq.enqueue(
                 db, "usage_write",
                 _record(auth, model, request_id, status, None, None, 0),
-                idempotency_key=f"usage:{request_id}",
+                idempotency_key=_idempotency_key("usage", auth, request_id),
             )
     except Exception as exc:
         logger.warning("error_record_enque_failed", error=str(exc))
 
 
 async def _account(request: Request, auth: AuthResult | None, record_or_factory) -> None:
-    """响应完成后的记账(BackgroundTask):预算/TPM 计数(Redis 原子)+ 账本走持久队列。
+    """响应完成后的记账(BackgroundTask):账本先持久化,再更新 Redis 快路径计数。
 
-    v3 升级:账本行经 Streams(at-least-once + 幂等键 usage:{request_id})落库 ——
-    网关崩溃在途账本不再丢;原进程内单写者退役(ADR-004)。
+    顺序很重要:账本是事实来源,Redis 是可重建的缓存。先 enqueue 意味着即使
+    记账时 Redis 抖动,账本仍在;预算计数可由 rebuild_from_db 修复。
     record_or_factory:流式路径传可调用对象(usage 流结束才可知)。
     """
     state = request.app.state
     record = record_or_factory() if callable(record_or_factory) else record_or_factory
-    if auth is not None and record["status"] == 200 and record["total_tokens"] > 0:
-        await quota_service.account_tokens(state.redis, auth.key_id, record["total_tokens"])
-
     from app.queue.streams import TaskQueue
 
     tq: TaskQueue = state.task_queue
-    async with state.session_factory() as db:
-        await tq.enqueue(
-            db, "usage_write", record,
-            idempotency_key=f"usage:{record['request_id']}",
-        )
+    try:
+        async with state.session_factory() as db:
+            await tq.enqueue(
+                db, "usage_write", record,
+                idempotency_key=_idempotency_key("usage", auth, record["request_id"]),
+            )
 
-        # webhook 回调(幂等键=request_id):请求完成事件推送给订阅方
-        if auth is not None and record["status"] == 200 and state.settings.auth_enabled:
-            tenant = (
-                await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
-            ).scalar_one_or_none()
-            if tenant and tenant.webhook_url:
-                await tq.enqueue(
-                    db,
-                    "webhook_callback",
-                    {
-                        "webhook_url": tenant.webhook_url,
-                        "request_id": record["request_id"],
-                        "model": record["model"],
-                        "total_tokens": record["total_tokens"],
-                    },
-                    idempotency_key=f"webhook:{record['request_id']}",
-                )
-    metrics.USAGE_QUEUE_DEPTH.set(await tq.backlog())
+            # webhook 回调(幂等键=租户+request_id):请求完成事件推送给订阅方
+            if auth is not None and record["status"] == 200 and state.settings.auth_enabled:
+                tenant = (
+                    await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
+                ).scalar_one_or_none()
+                if tenant and tenant.webhook_url:
+                    await tq.enqueue(
+                        db,
+                        "webhook_callback",
+                        {
+                            "webhook_url": tenant.webhook_url,
+                            "request_id": record["request_id"],
+                            "model": record["model"],
+                            "total_tokens": record["total_tokens"],
+                        },
+                        idempotency_key=_idempotency_key("webhook", auth, record["request_id"]),
+                    )
+    except Exception as exc:
+        logger.exception("usage_enqueue_failed", error=str(exc))
+
+    # 有真实 token 消耗就计量(流式中途断开也已产生的 token 不应漏计)
+    if auth is not None and record["total_tokens"] > 0:
+        try:
+            await quota_service.account_tokens(state.redis, auth.key_id, record["total_tokens"])
+        except Exception as exc:
+            logger.warning("quota_account_failed", error=str(exc))
+
+    try:
+        metrics.USAGE_QUEUE_DEPTH.set(await tq.backlog())
+    except Exception as exc:
+        logger.warning("queue_depth_metric_failed", error=str(exc))
 
 
 @router.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request) -> Response:
     state = request.app.state
+    request_t0 = time.perf_counter()
     payload = req.upstream_payload()
     request_id = current_request_id()
 
@@ -303,6 +377,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     if state.settings.auth_enabled:
         auth = await _authenticate(request, _bearer(request.headers.get("authorization")))
         await _admit(request, auth, req.model)
+
+    # 计费模式下的流式请求强制 include_usage:否则客户端不传该参数时,
+    # 上游不返回 usage,网关只能记 0 token(真实成本漏计)。请求体被增强,
+    # 响应仍是字节级透传;客户端会多收到一个 usage-only chunk(OpenAI 规范允许)。
+    if req.stream and state.settings.auth_enabled and state.settings.force_stream_usage:
+        stream_options = dict(payload.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        payload["stream_options"] = stream_options
 
     forward_headers = {k: v for k, v in request.headers.items() if k in _FORWARD_HEADERS}
 
@@ -315,20 +397,33 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             logger.warning("upstream_transport_error", error=str(exc), status=status)
             await _enqueue_error(state, auth, req.model, request_id, status)
             return _gateway_error(status, message, "bad_gateway", code)
+        except GatewayError as exc:
+            await _enqueue_error(state, auth, req.model, request_id, exc.status)
+            raise
 
         if not opened:
-            # 渠道遍历后的合成响应(非流式错误透传 或 全渠道耗尽)
+            # 渠道遍历后的合成响应(非流式错误透传 或 全渠道耗尽):也要进账本,
+            # 否则审计里会缺掉一整类流式失败请求。
+            latency_ms = (time.perf_counter() - request_t0) * 1000
+            record = _record(
+                auth, req.model, request_id, resp.status_code, None, None, latency_ms,
+                channel=channel or "exhausted",
+            )
+            _record_metrics(
+                auth, req.model, channel or "exhausted", resp.status_code, None,
+                latency_ms=latency_ms if resp.status_code == 200 else None,
+            )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
                 media_type="application/json",
                 headers={"x-upstream-channel": channel or "exhausted"},
+                background=BackgroundTask(_account, request, auth, record),
             )
 
-        holder: dict = {"usage": None, "ttft_ms": None}
+        holder: dict = {"usage": None, "ttft_ms": None, "status": 200, "latency_ms": 0}
 
         async def relay() -> AsyncIterator[bytes]:
-            t0 = time.perf_counter()
             acc = UsageAccumulator()
 
             def on_first(ttft_ms: float) -> None:
@@ -337,37 +432,45 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 logger.info("ttft_ms", value=round(ttft_ms, 2), channel=channel)
 
             try:
-                async for chunk in relay_stream(resp.aiter_raw(), on_first_event=on_first):
+                async for chunk in relay_stream(
+                    resp.aiter_raw(), on_first_event=on_first, start_time=request_t0
+                ):
                     acc.feed(chunk)  # 旁观解析 usage,不影响透传字节
                     yield chunk
+            except asyncio.CancelledError:
+                # 客户端断开:上游可能已产生 token,账本标 499,不伪装成 2xx。
+                holder["status"] = 499
+                raise
             except READ_ERRORS as exc:
+                holder["status"] = 502
                 logger.warning("upstream_read_error_midstream", error=str(exc))
                 yield b'event: error\ndata: {"message": "upstream read timeout mid-stream"}\n\n'
             finally:
                 await resp.aclose()
                 holder["usage"] = acc.usage
+                holder["latency_ms"] = int((time.perf_counter() - request_t0) * 1000)
+                # 指标必须在流真正结束后记:此前在构造 StreamResponse 时记,
+                # TTFT/usage 永远还是 None/0,线上看板会展示假数据。
+                _record_metrics(
+                    auth,
+                    req.model,
+                    channel or "exhausted",
+                    holder["status"],
+                    holder["usage"],
+                    ttft_ms=holder["ttft_ms"],
+                )
                 logger.info(
-                    "stream_done", duration_ms=round((time.perf_counter() - t0) * 1000, 2)
+                    "stream_done",
+                    duration_ms=holder["latency_ms"],
+                    status=holder["status"],
                 )
 
         def make_record() -> dict:
             return _record(
-                auth, req.model, request_id, 200, holder["usage"], holder["ttft_ms"], 0,
+                auth, req.model, request_id, holder["status"],
+                holder["usage"], holder["ttft_ms"], holder["latency_ms"],
                 channel=channel or "",
             )
-
-        tenant_label = auth.tenant_id if auth else "anonymous"
-        if holder["ttft_ms"] is not None:
-            metrics.TTFT.labels(channel=channel or "exhausted").observe(holder["ttft_ms"])
-        metrics.REQUESTS.labels(
-            tenant=tenant_label, channel=channel or "exhausted", status_class="2xx"
-        ).inc()
-        metrics.TOKENS.labels(tenant=tenant_label, model=req.model, kind="prompt").inc(
-            (holder["usage"] or {}).get("prompt_tokens", 0)
-        )
-        metrics.TOKENS.labels(tenant=tenant_label, model=req.model, kind="completion").inc(
-            (holder["usage"] or {}).get("completion_tokens", 0)
-        )
 
         return StreamingResponse(
             relay(),
@@ -392,10 +495,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             exact_hit = True
             metrics.CACHE_HITS.inc()
             logger.info("cache_hit", request_id=request_id)
-            record = _record(auth, req.model, request_id, 200, cached.get("usage"), None, 0, channel="cache")
-            metrics.REQUESTS.labels(
-                tenant=auth.tenant_id, channel="cache", status_class="2xx"
-            ).inc()
+            latency_ms = (time.perf_counter() - request_t0) * 1000
+            record = _record(
+                auth, req.model, request_id, 200, cached.get("usage"), None, latency_ms,
+                channel="cache",
+            )
+            _record_metrics(
+                auth, req.model, "cache", 200, cached.get("usage"), latency_ms=latency_ms
+            )
             return Response(
                 content=json.dumps(cached, ensure_ascii=False).encode(),
                 status_code=200,
@@ -405,41 +512,42 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             )
         metrics.CACHE_MISSES.inc()
 
-    # 语义缓存(精确未命中时):问题向量召回,阈值以上直接复用答案
-    if auth is not None and not exact_hit and semantic_cache.semantic_enabled(state.settings, req):
-        question = next(
-            (m.content for m in reversed(req.messages) if m.role == "user" and isinstance(m.content, str)),
-            "",
+    # 语义缓存(精确未命中时):问题向量召回,阈值以上直接复用答案。
+    # context_digest 绑定 system/历史消息与采样参数,防止不同 system prompt 串答案。
+    semantic_ctx = None
+    question = _last_user_question(req)
+    if auth is not None and semantic_cache.semantic_enabled(state.settings, req):
+        semantic_ctx = semantic_cache.context_digest(req.model, payload)
+    if auth is not None and not exact_hit and semantic_ctx is not None and question:
+        hit = await semantic_cache.search(
+            state.redis, state.embedder, auth.tenant_id, req.model, semantic_ctx,
+            question, state.settings.semantic_cache_threshold,
         )
-        if question:
-            hit = await semantic_cache.search(
-                state.redis, state.embedder, auth.tenant_id, req.model,
-                question, state.settings.semantic_cache_threshold,
+        if hit is not None:
+            metrics.CACHE_HITS.inc()
+            logger.info("semantic_cache_hit", request_id=request_id, score=hit["score"])
+            latency_ms = (time.perf_counter() - request_t0) * 1000
+            record = _record(
+                auth, req.model, request_id, 200,
+                hit["answer"].get("usage"), None, latency_ms, channel="cache-semantic",
             )
-            if hit is not None:
-                metrics.CACHE_HITS.inc()
-                logger.info("semantic_cache_hit", request_id=request_id, score=hit["score"])
-                record = _record(
-                    auth, req.model, request_id, 200,
-                    hit["answer"].get("usage"), None, 0, channel="cache-semantic",
-                )
-                metrics.REQUESTS.labels(
-                    tenant=auth.tenant_id, channel="cache-semantic", status_class="2xx"
-                ).inc()
-                return Response(
-                    content=json.dumps(hit["answer"], ensure_ascii=False).encode(),
-                    status_code=200,
-                    media_type="application/json",
-                    headers={
-                        "x-cache": "SEMANTIC_HIT",
-                        "x-cache-score": str(hit["score"]),
-                        "x-upstream-channel": "cache-semantic",
-                    },
-                    background=BackgroundTask(_account, request, auth, record),
-                )
-            metrics.CACHE_MISSES.inc()
+            _record_metrics(
+                auth, req.model, "cache-semantic", 200,
+                hit["answer"].get("usage"), latency_ms=latency_ms,
+            )
+            return Response(
+                content=json.dumps(hit["answer"], ensure_ascii=False).encode(),
+                status_code=200,
+                media_type="application/json",
+                headers={
+                    "x-cache": "SEMANTIC_HIT",
+                    "x-cache-score": str(hit["score"]),
+                    "x-upstream-channel": "cache-semantic",
+                },
+                background=BackgroundTask(_account, request, auth, record),
+            )
+        metrics.CACHE_MISSES.inc()
 
-    t0 = time.perf_counter()
     try:
         channel, resp = await _dispatch_non_stream(state, payload, forward_headers)
     except UPSTREAM_TRANSPORT_ERRORS as exc:
@@ -447,8 +555,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
         logger.warning("upstream_transport_error", error=str(exc), status=status)
         await _enqueue_error(state, auth, req.model, request_id, status)
         return _gateway_error(status, message, "bad_gateway", code)
+    except GatewayError as exc:
+        await _enqueue_error(state, auth, req.model, request_id, exc.status)
+        raise
 
-    latency_ms = (time.perf_counter() - t0) * 1000
+    latency_ms = (time.perf_counter() - request_t0) * 1000
     usage = None
     body_json = None
     if resp.status_code == 200:
@@ -462,37 +573,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
         # 语义缓存入库(精确与语义同源;问题取最后一条 user 消息)
         if (
             auth is not None
-            and semantic_cache.semantic_enabled(state.settings, req)
+            and semantic_ctx is not None
+            and question
             and body_json is not None
         ):
-            question = next(
-                (m.content for m in reversed(req.messages) if m.role == "user" and isinstance(m.content, str)),
-                "",
+            await semantic_cache.store(
+                state.redis, state.embedder, auth.tenant_id, req.model, semantic_ctx,
+                question, body_json, state.settings.semantic_cache_ttl,
             )
-            if question:
-                await semantic_cache.store(
-                    state.redis, state.embedder, auth.tenant_id, req.model,
-                    question, body_json, state.settings.semantic_cache_ttl,
-                )
     record = _record(
         auth, req.model, request_id, resp.status_code, usage, None, latency_ms,
         channel=channel or "",
     )
-    tenant_label = auth.tenant_id if auth else "anonymous"
-    if resp.status_code == 200:
-        metrics.REQUEST_LATENCY.labels(channel=channel or "exhausted").observe(latency_ms)
-    metrics.REQUESTS.labels(
-        tenant=tenant_label,
-        channel=channel or "exhausted",
-        status_class=metrics.status_class(resp.status_code),
-    ).inc()
-    if usage:
-        metrics.TOKENS.labels(tenant=tenant_label, model=req.model, kind="prompt").inc(
-            usage.get("prompt_tokens", 0)
-        )
-        metrics.TOKENS.labels(tenant=tenant_label, model=req.model, kind="completion").inc(
-            usage.get("completion_tokens", 0)
-        )
+    _record_metrics(
+        auth, req.model, channel or "exhausted", resp.status_code, usage,
+        latency_ms=latency_ms if resp.status_code == 200 else None,
+    )
     extra_headers = {"x-upstream-channel": channel or "exhausted"}
     if rkey is not None:
         extra_headers["x-cache"] = "MISS"

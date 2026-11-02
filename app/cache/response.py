@@ -19,13 +19,17 @@ def cache_enabled(settings: Settings, req) -> bool:
         return False
     if req.stream or req.tools:
         return False
-    temperature = req.temperature
-    return temperature is None or temperature <= 0
+    # 必须显式 temperature=0 才缓存。OpenAI 的默认温度是 1.0,把 None 当确定性
+    # 会把随机答案缓存成"精确命中"——这是缓存正确性红线。
+    return req.temperature is not None and req.temperature <= 0
 
 
 def cache_key(tenant_id: str, model: str, payload: dict) -> str:
-    """缓存键:租户 + 模型 + 归一化请求体(exclude stream/stream_options 等传输字段)。"""
-    normalized = {k: v for k, v in payload.items() if k not in ("stream", "stream_options", "user")}
+    """缓存键:租户 + 模型 + 归一化请求体(exclude stream/stream_options 传输字段)。
+
+    user 参与键:同租户下不同终端用户不共享响应缓存(账号级隐私边界)。
+    """
+    normalized = {k: v for k, v in payload.items() if k not in ("stream", "stream_options")}
     digest = hashlib.sha256(
         json.dumps([tenant_id, model, normalized], sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()

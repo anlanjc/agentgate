@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTGATE_", env_file=".env", extra="ignore")
 
     app_name: str = "agentgate"
+    environment: str = "dev"  # prod 时强制 admin_token,拒绝"部署了但管理面裸奔"
     host: str = "127.0.0.1"
     port: int = 8100
     log_level: str = "INFO"
@@ -33,7 +35,10 @@ class Settings(BaseSettings):
     auth_enabled: bool = True
     admin_token: str = ""  # 为空时 admin API 不设防(仅限本机开发)
 
-    # M5:精确响应缓存(默认关闭;只缓 temperature≤0 的非流式无工具请求,租户隔离见 app/cache/response.py)
+    # 鉴权开启时,流式请求强制向上游要 usage(否则客户端不传 include_usage 时账本记 0 token)
+    force_stream_usage: bool = True
+
+    # M5:精确响应缓存(默认关闭;只缓显式 temperature≤0 的非流式无工具请求,租户隔离见 app/cache/response.py)
     response_cache_enabled: bool = False
     response_cache_ttl: int = 300
 
@@ -49,6 +54,18 @@ class Settings(BaseSettings):
     otel_exporter: str = "console"  # console | otlp
     otel_otlp_endpoint: str = ""
     otel_service_version: str = "0.1.0"
+
+    @model_validator(mode="after")
+    def _fail_closed_in_prod(self):
+        if self.environment.lower() != "prod":
+            return self
+        if not self.admin_token or self.admin_token in {"change-me", "changeme"}:
+            raise ValueError(
+                "AGENTGATE_ENVIRONMENT=prod 时必须设置非默认 AGENTGATE_ADMIN_TOKEN"
+            )
+        if not self.auth_enabled:
+            raise ValueError("AGENTGATE_ENVIRONMENT=prod 时禁止关闭 auth_enabled")
+        return self
 
 
 @lru_cache

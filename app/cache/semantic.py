@@ -81,16 +81,39 @@ def semantic_enabled(settings: Settings, req) -> bool:
         settings.semantic_cache_enabled
         and not req.stream
         and not req.tools
-        and (req.temperature is None or req.temperature <= 0)
+        and req.temperature is not None
+        and req.temperature <= 0
     )
 
 
-def _index_key(tenant_id: str, model: str) -> str:
-    return f"semidx:{tenant_id}:{model}"
+def context_digest(model: str, payload: dict) -> str:
+    """把"语义可比域"压成短指纹:模型 + system/历史消息 + 采样参数 + user。
+
+    只把最后一条 user 消息当向量查询;其余上下文必须完全相同才允许语义命中。
+    否则同一个问题在不同 system prompt 下会拿到别人的答案(串答案/提示词越权)。
+    """
+    messages = payload.get("messages") or []
+    last_user_idx = -1
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            last_user_idx = i
+    context_messages = [m for i, m in enumerate(messages) if i != last_user_idx]
+    context = {
+        k: v for k, v in payload.items()
+        if k not in ("messages", "stream", "stream_options")
+    }
+    context["messages"] = context_messages
+    context["model"] = model
+    raw = json.dumps(context, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _entry_key(tenant_id: str, model: str, digest: str) -> str:
-    return f"sementry:{tenant_id}:{model}:{digest}"
+def _index_key(tenant_id: str, model: str, ctx: str) -> str:
+    return f"semidx:{tenant_id}:{model}:{ctx}"
+
+
+def _entry_key(tenant_id: str, model: str, ctx: str, digest: str) -> str:
+    return f"sementry:{tenant_id}:{model}:{ctx}:{digest}"
 
 
 def _digest(vec: list[float]) -> str:
@@ -102,21 +125,35 @@ async def search(
     embedder: Embedder,
     tenant_id: str,
     model: str,
+    ctx: str,
     question: str,
     threshold: float,
     max_scan: int = 200,
 ) -> dict | None:
     """余弦扫描召回;命中返回缓存条目(answer/usage),未命中 None。"""
     vec = await embedder.embed(question)
-    idx = _index_key(tenant_id, model)
+    idx = _index_key(tenant_id, model, ctx)
     members = await redis.zrange(idx, 0, max_scan - 1, desc=True)  # 时间倒序近似最近优先
+    if not members:
+        return None
+    # 一次 MGET 取候选向量,而不是 N 次串行 GET(N=200 时是 200 个 RTT)。
+    keys = [
+        _entry_key(
+            tenant_id, model, ctx,
+            m.decode() if isinstance(m, bytes) else str(m),
+        )
+        for m in members
+    ]
+    raws = await redis.mget(keys)
     best: tuple[float, dict] | None = None
-    for m in members:
-        raw = await redis.get(_entry_key(tenant_id, model, m.decode() if isinstance(m, bytes) else str(m)))
+    for raw in raws:
         if raw is None:
             continue
-        entry = json.loads(raw)
-        score = _cosine(vec, entry["vector"])
+        try:
+            entry = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        score = _cosine(vec, entry.get("vector", []))
         if best is None or score > best[0]:
             best = (score, entry)
     if best is not None and best[0] >= threshold:
@@ -129,6 +166,7 @@ async def store(
     embedder: Embedder,
     tenant_id: str,
     model: str,
+    ctx: str,
     question: str,
     body: dict,
     ttl: int,
@@ -137,10 +175,10 @@ async def store(
         return
     vec = await embedder.embed(question)
     d = _digest(vec)
-    idx = _index_key(tenant_id, model)
+    idx = _index_key(tenant_id, model, ctx)
     pipe = redis.pipeline(transaction=False)
     pipe.set(
-        _entry_key(tenant_id, model, d),
+        _entry_key(tenant_id, model, ctx, d),
         json.dumps({"vector": vec, "question": question, "answer": body}, ensure_ascii=False),
         ex=ttl,
     )

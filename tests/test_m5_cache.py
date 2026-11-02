@@ -7,7 +7,8 @@ from tests.conftest import TENANT_ID, auth_headers
 
 
 def _body(**extra) -> dict:
-    body = {"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}
+    # 缓存门控要求显式 temperature=0;OpenAI 缺省温度是 1.0,不能当确定性请求。
+    body = {"model": "mock-model", "messages": [{"role": "user", "content": "hi"}], "temperature": 0}
     body.update(extra)
     return body
 
@@ -79,6 +80,16 @@ async def test_cache_tenant_isolation(cache_gateway):
     assert r1.headers["x-cache"] == "MISS"
     r2 = await client.post("/v1/chat/completions", json=_body(), headers=h_b)
     assert r2.headers["x-cache"] == "MISS"  # 不同租户不共享
+
+
+async def test_default_temperature_is_not_cached(cache_gateway):
+    """缺省 temperature(上游默认 1.0)不能当确定性请求缓存。"""
+    client, app, raw = cache_gateway
+    h = auth_headers(raw)
+    body = {"model": "mock-model", "messages": [{"role": "user", "content": "default-temp"}]}
+    r1 = await client.post("/v1/chat/completions", json=body, headers=h)
+    r2 = await client.post("/v1/chat/completions", json=body, headers=h)
+    assert "x-cache" not in r1.headers and "x-cache" not in r2.headers
 
 
 async def test_nondeterministic_requests_not_cached(cache_gateway):

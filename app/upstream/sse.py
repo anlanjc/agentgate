@@ -92,15 +92,20 @@ async def relay_stream(
     source: AsyncIterator[bytes],
     on_first_event=None,
     on_chunk=None,
+    *,
+    start_time: float | None = None,
 ) -> AsyncIterator[bytes]:
     """旁观式转发:原样 yield 字节,仅在首个 data: 行时回调 on_first_event(ttft_ms)。
+
+    start_time 由路由层传入"请求进入网关"的时刻,这样 TTFT 包含鉴权/准入/建连,
+    而不是只测 relay 生成器启动后的时间(后者会系统性低估首 token 延迟)。
 
     解析器不修改任何字节 —— 透传纪律。
     """
     detector = FirstDataEventDetector()
     import time
 
-    t0 = time.perf_counter()
+    t0 = start_time if start_time is not None else time.perf_counter()
     async for chunk in source:
         if detector.feed(chunk) and on_first_event:
             on_first_event((time.perf_counter() - t0) * 1000)

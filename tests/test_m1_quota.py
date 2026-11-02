@@ -60,6 +60,18 @@ async def test_ledger_nonstream_and_stream(auth_gateway):
     assert usage["total_tokens"] == 36  # mock 每 次 18(流式由 usage 提取器从最终 chunk 解出)
 
 
+async def test_stream_without_include_usage_is_still_billed(auth_gateway):
+    """客户端不传 include_usage 时,网关也必须拿到 usage 记账(强制注入)。"""
+    client, app, mock, raw = auth_gateway
+    h = auth_headers(raw)
+    r = await client.post("/v1/chat/completions", json=_body(stream=True), headers=h)
+    assert r.status_code == 200
+    await app.state.task_queue.flush()
+    usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
+    assert usage["requests"] == 1
+    assert usage["total_tokens"] == 18  # 不是 0:客户端没要 usage 也计费
+
+
 async def test_concurrent_accounting_atomic(auth_gateway):
     """并发 100:TPM 计数器恰好 1800(原子 INCRBY 零丢失),账本恰好 100 行。"""
     client, app, mock, raw = auth_gateway
@@ -74,6 +86,55 @@ async def test_concurrent_accounting_atomic(auth_gateway):
     usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
     assert usage["requests"] == 100
     assert usage["total_tokens"] == 1800
+
+
+async def test_same_request_id_across_tenants_does_not_collide(auth_gateway):
+    """request_id 可由客户端伪造:幂等域必须按租户隔离,不能吞掉别家账本。"""
+    client, app, mock, raw_a = auth_gateway
+    other = (await client.post("/admin/tenants", json={"name": "other-tenant"})).json()
+    key_b = (
+        await client.post(f"/admin/tenants/{other['id']}/keys", json={"name": "b"})
+    ).json()
+    rid = "forged-shared-request-id"
+    r1 = await client.post(
+        "/v1/chat/completions", json=_body(), headers={**auth_headers(raw_a), "X-Request-Id": rid}
+    )
+    r2 = await client.post(
+        "/v1/chat/completions", json=_body(), headers={**auth_headers(key_b["key"]), "X-Request-Id": rid}
+    )
+    assert r1.status_code == r2.status_code == 200
+    await app.state.task_queue.flush()
+    ua = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
+    ub = (await client.get(f"/admin/tenants/{other['id']}/usage")).json()
+    assert ua["requests"] == 1 and ub["requests"] == 1
+
+
+async def test_duplicate_ledger_delivery_writes_once(auth_gateway):
+    """模拟 handler 写库后崩溃重投:账本唯一键保证只落一行。"""
+    client, app, mock, raw = auth_gateway
+    from app.db.models import UsageRecord
+    from app.queue.webhooks import write_usage
+
+    payload = {
+        "request_id": "dup-ledger-1", "key_id": "k-test", "tenant_id": TENANT_ID,
+        "model": "mock-model", "prompt_tokens": 1, "completion_tokens": 1,
+        "total_tokens": 2, "ttft_ms": None, "latency_ms": 1, "status": 200, "channel": "mock",
+    }
+    a = await write_usage(payload, app.state.session_factory)
+    b = await write_usage(payload, app.state.session_factory)
+    assert a["written"] is True and b["duplicate"] is True
+    async with app.state.session_factory() as db:
+        from sqlalchemy import func, select
+
+        n = (
+            await db.execute(
+                select(func.count(UsageRecord.id)).where(
+                    UsageRecord.tenant_id == TENANT_ID,
+                    UsageRecord.request_id == "dup-ledger-1",
+                )
+            )
+        ).scalar_one()
+    assert n == 1
 
 
 async def test_budget_rebuild_from_db(auth_gateway):

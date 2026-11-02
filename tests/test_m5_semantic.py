@@ -12,7 +12,12 @@ from tests.conftest import auth_headers
 
 
 def _body(**extra) -> dict:
-    body = {"model": "mock-model", "messages": [{"role": "user", "content": "上海公积金贷款额度是多少"}]}
+    # 语义缓存同样要求显式 temperature=0(缺省 1.0 不是确定性请求)。
+    body = {
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "上海公积金贷款额度是多少"}],
+        "temperature": 0,
+    }
     body.update(extra)
     return body
 
@@ -108,6 +113,31 @@ async def test_semantic_cache_tenant_isolation(sem_gateway):
         "/v1/chat/completions",
         json=_body(messages=[{"role": "user", "content": "上海公积金贷款额度能贷多少"}]),
         headers=h_b,
+    )
+    assert r2.status_code == 200
+    assert "SEMANTIC_HIT" != r2.headers.get("x-cache", "")
+
+
+async def test_semantic_cache_context_is_isolated(sem_gateway):
+    """同问题、不同 system prompt 不得命中:缓存域必须绑定上下文指纹。"""
+    client, app, raw, _ = sem_gateway
+    h = auth_headers(raw)
+    r1 = await client.post(
+        "/v1/chat/completions",
+        json=_body(messages=[
+            {"role": "system", "content": "你是公积金客服"},
+            {"role": "user", "content": "上海公积金贷款额度是多少"},
+        ]),
+        headers=h,
+    )
+    assert r1.status_code == 200
+    r2 = await client.post(
+        "/v1/chat/completions",
+        json=_body(messages=[
+            {"role": "system", "content": "你是医疗客服"},
+            {"role": "user", "content": "上海公积金贷款额度是多少"},
+        ]),
+        headers=h,
     )
     assert r2.status_code == 200
     assert "SEMANTIC_HIT" != r2.headers.get("x-cache", "")

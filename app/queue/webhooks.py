@@ -44,11 +44,34 @@ async def deliver_webhook(payload: dict) -> dict:
 
 
 async def write_usage(payload: dict, session_factory) -> dict:
-    """账本落库任务体:由 Streams 消费者执行(at-least-once + 幂等键去重)。"""
+    """账本落库任务体:由 Streams 消费者执行。
+
+    两层幂等:
+    1. TaskRecord 状态机保证同一任务不重复执行(正常路径);
+    2. usage_records(tenant_id, request_id) UNIQUE 兜底 —— handler 写库成功后、
+       任务状态回写前进程崩溃时,重投会再次执行 handler,唯一键让账本仍只有一行。
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
     from app.db.models import UsageRecord
 
     record = {k: v for k, v in payload.items() if k in UsageRecord.__table__.columns}
+    if record.get("key_id") == "anonymous":
+        record["key_id"] = None
     async with session_factory() as db:
+        exists = await db.execute(
+            select(UsageRecord.id).where(
+                UsageRecord.tenant_id == record.get("tenant_id", ""),
+                UsageRecord.request_id == record.get("request_id", ""),
+            )
+        )
+        if exists.scalar_one_or_none() is not None:
+            return {"written": False, "duplicate": True, "request_id": record.get("request_id")}
         db.add(UsageRecord(**record))
-        await db.commit()
-    return {"written": True, "request_id": payload.get("request_id")}
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            return {"written": False, "duplicate": True, "request_id": record.get("request_id")}
+    return {"written": True, "request_id": record.get("request_id")}

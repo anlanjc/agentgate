@@ -6,7 +6,18 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -46,13 +57,25 @@ class VirtualKey(Base):
 
 
 class UsageRecord(Base):
-    """用量账本(只追加,不更新)——计费对账的最终事实来源。"""
+    """用量账本(只追加,不更新)——计费对账的最终事实来源。
+
+    幂等边界:``(tenant_id, request_id)`` 唯一。消费端重投/崩溃恢复可能重复执行
+    handler,唯一约束保证账本最多落一行;request_id 由客户端可传,因此必须按租户
+    隔离,不能做全局唯一(否则可被伪造 ID 阻塞其他租户记账)。
+    """
 
     __tablename__ = "usage_records"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "request_id", name="uq_usage_tenant_request"),
+        Index("ix_usage_records_tenant_created", "tenant_id", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), index=True)
-    key_id: Mapped[str] = mapped_column(ForeignKey("virtual_keys.id"), index=True)
+    # auth_enabled=False 的纯代理模式没有 virtual key:账本仍保留,key_id 为空。
+    key_id: Mapped[str | None] = mapped_column(
+        ForeignKey("virtual_keys.id"), index=True, nullable=True
+    )
     tenant_id: Mapped[str] = mapped_column(String(32), index=True)
     model: Mapped[str] = mapped_column(String(128))
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -75,12 +98,20 @@ class Channel(Base):
     base_url: Mapped[str] = mapped_column(String(512))
     api_key: Mapped[str] = mapped_column(String(256), default="")
     models: Mapped[list] = mapped_column(JSON, default=list)
+    connect_timeout: Mapped[float] = mapped_column(Float, default=5.0)
+    read_timeout: Mapped[float] = mapped_column(Float, default=300.0)
     weight: Mapped[int] = mapped_column(Integer, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class TaskRecord(Base):
-    """异步任务账本:幂等键 UNIQUE 是"不重"的最终防线(at-least-once 投递 + 幂等消费)。"""
+    """异步任务账本:幂等键 UNIQUE 是"不重"的最终防线(at-least-once 投递 + 幂等消费)。
+
+    published_at 是 **transactional outbox** 的发布水位:
+    - 先提交 task_records(意图),再 XADD(投递);XADD 失败时 published_at 为空;
+    - sweeper 定期扫描 published_at IS NULL AND status='pending' 重新投递;
+    - 重复投递由消费端状态机 + 账本唯一键吞掉,因此"至少一次"不会变成"至少两次副作用"。
+    """
 
     __tablename__ = "task_records"
 
@@ -91,5 +122,8 @@ class TaskRecord(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/processing/done/dead
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

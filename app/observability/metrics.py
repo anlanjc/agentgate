@@ -35,12 +35,12 @@ TTFT = Histogram(
 
 USAGE_QUEUE_DEPTH = Gauge(
     "agentgate_usage_queue_depth",
-    "记账队列积压深度(应接近 0,持续 >0 说明落库跟不上)",
+    "任务队列真实积压(未投递 + PEL;ACK 后 XDEL,应接近 0)",
 )
 
-USAGE_DROPPED = Counter(
-    "agentgate_usage_dropped_total",
-    "记账队列溢出丢弃数(正常应为 0)",
+TASKS_DEAD = Counter(
+    "agentgate_tasks_dead_total",
+    "进入死信流的任务数(正常应为 0;>0 需查 DLQ 或 webhook)",
 )
 
 CACHE_HITS = Counter(

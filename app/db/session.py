@@ -8,7 +8,7 @@ from app.db.models import Base
 def build_engine(db_url: str) -> AsyncEngine:
     kwargs: dict = {"echo": False}
     if db_url.startswith("sqlite"):
-        # SQLite:并发写靠单写者记账(见 quota/writer.py),放宽锁等待兜底
+        # SQLite 测试口径:单写者 Streams 消费者 + 唯一键兜底,放宽锁等待。
         kwargs["connect_args"] = {"timeout": 10}
     return create_async_engine(db_url, **kwargs)
 
