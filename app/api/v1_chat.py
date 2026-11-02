@@ -232,7 +232,10 @@ async def _admit(request: Request, auth: AuthResult, model: str) -> None:
     from redis.exceptions import RedisError
 
     try:
-        r = await admit(state.redis, key_id=auth.key_id, capacity=auth.rpm_limit, amount=1)
+        r = await admit(
+            state.redis, key_id=auth.key_id, capacity=auth.rpm_limit, amount=1,
+            tenant_id=auth.tenant_id if auth.tenant_budget_tokens is not None else None,
+        )
     except RedisError as exc:
         logger.warning("admission_fail_closed", error=str(exc))
         raise GatewayError(
@@ -248,6 +251,11 @@ async def _admit(request: Request, auth: AuthResult, model: str) -> None:
         raise GatewayError(429, "tpm limit exceeded", "rate_limit_error", "tpm_exceeded", retry_after_s=60)
     if auth.budget_tokens is not None and r.budget_spent >= auth.budget_tokens:
         raise GatewayError(402, "budget exhausted", "insufficient_quota", "budget_exceeded")
+    if auth.tenant_budget_tokens is not None and r.tenant_budget_spent >= auth.tenant_budget_tokens:
+        # 租户级兜底:换新 key 也绕不过(计数器跟租户走,不跟 key)
+        raise GatewayError(
+            402, "tenant budget exhausted", "insufficient_quota", "tenant_budget_exceeded",
+        )
 
 
 def _record(
@@ -368,7 +376,9 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
     # 有真实 token 消耗就计量(流式中途断开也已产生的 token 不应漏计)
     if auth is not None and record["total_tokens"] > 0:
         try:
-            await quota_service.account_tokens(state.redis, auth.key_id, record["total_tokens"])
+            await quota_service.account_tokens(
+                state.redis, auth.key_id, record["total_tokens"], tenant_id=auth.tenant_id
+            )
         except Exception as exc:
             logger.warning("quota_account_failed", error=str(exc))
 

@@ -56,10 +56,14 @@ return estimate
 """
 
 # 预算 + TPM 同一次 Lua 原子更新:不能出现"预算扣了、TPM 没扣"的中间态。
-# KEYS[1]=预算 KEYS[2]=当前窗 KEYS[3]=上一窗 KEYS[4]=估计值
+# KEYS[1]=key 预算 KEYS[2]=当前窗 KEYS[3]=上一窗 KEYS[4]=估计值 KEYS[5]=租户预算(可选)
 # ARGV[1]=tokens ARGV[2]=now_ms ARGV[3]=window_ms
 ACCOUNT_LUA = """
 local spent = redis.call('INCRBY', KEYS[1], ARGV[1])
+local tspent = 0
+if KEYS[5] then
+    tspent = redis.call('INCRBY', KEYS[5], ARGV[1])
+end
 
 local cur    = KEYS[2]
 local prev   = KEYS[3]
@@ -89,7 +93,7 @@ local prev_weight = 1 - (elapsed / win)
 if prev_weight < 0 then prev_weight = 0 end
 local estimate = math.floor(prev_count * prev_weight + cur_count)
 redis.call('SET', est, estimate, 'PX', win * 2)
-return {spent, estimate}
+return {spent, estimate, tspent}
 """
 
 # 兼容别名(单写者记账与测试经 tpm_window_add 调用;窗口长 60s)
@@ -141,20 +145,27 @@ async def tpm_window_get(redis: aredis.Redis, key_id: str) -> int:
     return int(value) if value else 0
 
 
-async def account_tokens(redis, key_id: str, tokens: int) -> tuple[int, int]:
-    """响应后记账:预算 INCRBY + TPM 滑动窗口合并为一次原子 Lua(单往返)。
+async def account_tokens(
+    redis, key_id: str, tokens: int, tenant_id: str | None = None
+) -> tuple[int, int]:
+    """响应后记账:key 预算 + 租户预算(可选)+ TPM 滑动窗口,一次原子 Lua(单往返)。
 
-    返回 (累计预算消耗, 当前 TPM 加权估计值)。原子性由 Redis 单线程保证。
+    返回 (key 累计预算消耗, 当前 TPM 加权估计值)。原子性由 Redis 单线程保证;
+    租户预算与 key 预算同一次 INCRBY,不存在"租户扣了 key 没扣"的中间态。
     """
     import time
 
     from app.ratelimit.lua import eval_cached
 
     now_ms = int(time.time() * 1000)
-    result = await eval_cached(
-        redis, ACCOUNT_LUA, 4, budget_key(key_id), f"{tpm_key(key_id)}:cur",
-        f"{tpm_key(key_id)}:prev", tpm_key(key_id), tokens, now_ms, TPM_WINDOW_MS,
-    )
+    keys = [
+        budget_key(key_id), f"{tpm_key(key_id)}:cur", f"{tpm_key(key_id)}:prev", tpm_key(key_id),
+    ]
+    numkeys = 4
+    if tenant_id:
+        keys.append(tenant_budget_key(tenant_id))
+        numkeys = 5
+    result = await eval_cached(redis, ACCOUNT_LUA, numkeys, *keys, tokens, now_ms, TPM_WINDOW_MS)
     return int(result[0]), int(result[1])
 
 
@@ -167,4 +178,21 @@ async def rebuild_from_db(redis: aredis.Redis, db: AsyncSession, key_id: str) ->
     )
     total = int(row.scalar_one())
     await redis.set(budget_key(key_id), total)
+    return total
+
+
+def tenant_budget_key(tenant_id: str) -> str:
+    """租户级预算计数器(P2 hardening:堵"多签几把 key 绕过单 key 预算")。"""
+    return f"budget:tenant:{tenant_id}"
+
+
+async def rebuild_tenant_from_db(redis: aredis.Redis, db: AsyncSession, tenant_id: str) -> int:
+    """租户预算计数从账本重建(设置租户预算时校准 / Redis 丢失后恢复)。"""
+    row = await db.execute(
+        select(func.coalesce(func.sum(UsageRecord.total_tokens), 0)).where(
+            UsageRecord.tenant_id == tenant_id, UsageRecord.status == 200
+        )
+    )
+    total = int(row.scalar_one())
+    await redis.set(tenant_budget_key(tenant_id), total)
     return total

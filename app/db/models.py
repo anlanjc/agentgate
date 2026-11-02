@@ -35,6 +35,8 @@ class Tenant(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)  # 任务完成回调
+    # 租户级月度/总量 token 预算(NULL=不限):key 级预算的兜底,堵"多签几把 key 绕预算"
+    budget_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

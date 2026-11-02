@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from app.ratelimit.lua import eval_cached
 
-# KEYS[1]=限流桶 KEYS[2]=tpm窗口 KEYS[3]=预算
+# KEYS[1]=限流桶 KEYS[2]=tpm窗口 KEYS[3]=key 预算 KEYS[4]=租户预算(可选,只读)
 # ARGV[1]=容量 ARGV[2]=速率 ARGV[3]=now_ms ARGV[4]=扣减量
 ADMIT_LUA = """
 local key    = KEYS[1]
@@ -45,7 +45,11 @@ redis.call('PEXPIRE', key, ttl_ms)
 
 local tpm = tonumber(redis.call('GET', KEYS[2]) or '0')
 local budget = tonumber(redis.call('GET', KEYS[3]) or '0')
-return {allowed, tostring(math.floor(tokens)), retry_after_ms, tpm, budget}
+local tbudget = 0
+if KEYS[4] then
+    tbudget = tonumber(redis.call('GET', KEYS[4]) or '0')
+end
+return {allowed, tostring(math.floor(tokens)), retry_after_ms, tpm, budget, tbudget}
 """
 
 
@@ -56,6 +60,7 @@ class AdmitResult:
     retry_after_ms: int
     tpm_window: int
     budget_spent: int
+    tenant_budget_spent: int = 0
 
 
 async def admit(
@@ -64,24 +69,27 @@ async def admit(
     key_id: str,
     capacity: int,
     amount: int = 1,
+    tenant_id: str | None = None,
 ) -> AdmitResult:
     import time
 
-    from app.quota.service import budget_key, tpm_key
+    from app.quota.service import budget_key, tenant_budget_key, tpm_key
 
     if capacity <= 0:
         return AdmitResult(False, 0, 60000, 0, 0)
     rate = capacity / 60.0
     now_ms = int(time.time() * 1000)
-    result = await eval_cached(
-        redis, ADMIT_LUA, 3,
-        f"rl:rpm:{key_id}", tpm_key(key_id), budget_key(key_id),
-        capacity, rate, now_ms, amount,
-    )
+    keys = [f"rl:rpm:{key_id}", tpm_key(key_id), budget_key(key_id)]
+    numkeys = 3
+    if tenant_id:
+        keys.append(tenant_budget_key(tenant_id))
+        numkeys = 4
+    result = await eval_cached(redis, ADMIT_LUA, numkeys, *keys, capacity, rate, now_ms, amount)
     return AdmitResult(
         rpm_allowed=int(result[0]) == 1,
         rpm_remaining=int(result[1]),
         retry_after_ms=int(result[2]),
         tpm_window=int(result[3]),
         budget_spent=int(result[4]),
+        tenant_budget_spent=int(result[5]) if len(result) > 5 else 0,
     )

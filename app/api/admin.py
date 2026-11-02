@@ -80,6 +80,34 @@ async def create_tenant(body: TenantCreate, request: Request) -> dict:
         return {"id": tenant.id, "name": tenant.name, "webhook_url": tenant.webhook_url}
 
 
+class TenantBudgetUpdate(BaseModel):
+    """租户级 token 预算(NULL=不限):key 预算的兜底,堵"多签几把 key 绕预算"。"""
+
+    budget_tokens: int | None = Field(default=None, ge=0)
+
+
+@router.post("/tenants/{tenant_id}/budget")
+async def set_tenant_budget(tenant_id: str, body: TenantBudgetUpdate, request: Request) -> dict:
+    """设置租户预算;计数器即时从账本校准(设置的是限额,已花费是账本事实)。
+
+    已缓存 key 的预算读数最长 60s 后生效(auth 缓存 TTL;预算是计量控制非安全
+    边界,窗口可接受)—— 新签发的 key 立即生效。
+    """
+    _require_admin(request)
+    async with request.app.state.session_factory() as db:
+        row = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant = row.scalar_one_or_none()
+        if tenant is None:
+            raise GatewayError(404, "tenant not found", "invalid_request_error", "tenant_not_found")
+        tenant.budget_tokens = body.budget_tokens
+        from app.quota.service import rebuild_tenant_from_db
+
+        spent = await rebuild_tenant_from_db(request.app.state.redis, db, tenant_id)
+        _audit(db, "tenant.budget_set", "tenant", tenant_id, {"budget_tokens": body.budget_tokens})
+        await db.commit()
+    return {"tenant_id": tenant_id, "budget_tokens": body.budget_tokens, "spent_tokens": spent}
+
+
 @router.post("/tenants/{tenant_id}/keys")
 async def create_key(tenant_id: str, body: KeyCreate, request: Request) -> dict:
     _require_admin(request)
