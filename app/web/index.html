@@ -62,6 +62,8 @@
         <button onclick="issueKey()">签发</button>
       </div>
       <div id="keyOut" class="keybox"></div>
+      <label style="margin-top:12px">该租户的 key(吊销立即生效)</label>
+      <table id="klist"><thead><tr><th>前缀</th><th>名称</th><th>限额</th><th>状态</th><th></th></tr></thead><tbody></tbody></table>
     </div>
 
     <div class="card">
@@ -100,7 +102,22 @@ async function loadTenants(){
   const opts = tenants.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
   $('#kTenant').innerHTML = opts; $('#uTenant').innerHTML = opts;
 }
-function pickTenant(id){ $('#kTenant').value = id; $('#uTenant').value = id; loadUsage(); }
+function pickTenant(id){ $('#kTenant').value = id; $('#uTenant').value = id; loadUsage(); loadKeyList(); }
+async function loadKeyList(){
+  const tid = $('#kTenant').value; if (!tid) return;
+  try {
+    const {keys} = await api(`/tenants/${tid}/keys`);
+    $('#klist tbody').innerHTML = keys.map(k => `<tr>
+      <td class="muted">${k.prefix}…</td><td>${k.name||'—'}</td>
+      <td class="muted">${k.rpm_limit}/min</td>
+      <td>${k.is_active ? '<span class="pill ok">有效</span>' : '<span class="pill cool">已吊销</span>'}</td>
+      <td>${k.is_active ? `<button class="ghost" onclick="revokeKey('${k.key_id}')">吊销</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">无</td></tr>';
+  } catch(e) { /* 租户刚创建时无 key,静默 */ }
+}
+async function revokeKey(kid){
+  await api(`/keys/${kid}/deactivate`, {method:'POST'});
+  toast('已吊销 ' + kid.slice(0,8)); loadKeyList();
+}
 async function createTenant(){
   const {id} = await api('/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:$('#tName').value})});
   toast('租户已创建 '+id.slice(0,8)); loadTenants();
@@ -124,6 +141,7 @@ async function purgeCache(){
 (async () => {
   $('#ver').textContent = 'v' + (await (await fetch('/health')).json()).version;
   await loadChannels(); await loadTenants();
+  if ($('#kTenant').value) await loadKeyList();
   if ($('#uTenant').value) await loadUsage();
   setInterval(loadChannels, 5000);  // 渠道健康 5s 自刷新
 })();

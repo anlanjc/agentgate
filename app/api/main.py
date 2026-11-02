@@ -114,6 +114,15 @@ def create_app(
         page = Path(__file__).resolve().parents[2] / "app" / "web" / "index.html"
         return FileResponse(page, media_type="text/html")
 
+    @app_.get("/playground")
+    async def playground():
+        from pathlib import Path
+
+        from starlette.responses import FileResponse
+
+        page = Path(__file__).resolve().parents[2] / "app" / "web" / "playground.html"
+        return FileResponse(page, media_type="text/html")
+
     return app_
 
 

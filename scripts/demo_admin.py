@@ -39,6 +39,7 @@ async def main() -> None:
         db_url="sqlite+aiosqlite:///./demo_admin.db",
         redis_url="redis://127.0.0.1:6379/6",
         auth_enabled=True,
+        response_cache_enabled=True,  # 演示口径:Playground 可现场看到 MISS→HIT
         log_level="WARNING",
     )
     import redis.asyncio as aredis

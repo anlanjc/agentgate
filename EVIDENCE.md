@@ -79,7 +79,7 @@
 | 2 | **多 worker 水平扩展** | **1.00x → 2.15x → 4.04x**(workers 1/2/4,1200 req @ c=50)——共享状态全在 Redis 的多副本设计被实测验证 | evidence/load_workers.md |
 | 3 | **MCP server**(2026 JD 命中) | 4 工具(渠道健康/用量对账/预算读数/签发 key)真 stdio 握手;**MCP 签发的 key 立即可用于网关**——共享状态面证明,非旁路 | test_m5_mcp(真子进程握手) |
 | 4 | **精确响应缓存** | 租户隔离键(安全边界)/确定性门控(temperature≤0 非流式无 tools)/X-Cache 头/命中率指标/账本 channel=cache/管理端清空 | test_m5_cache 5 项 |
-| 5 | **管理界面** | 单文件 web(/admin/web):渠道健康(EMA 实测)5s 自刷/租户/签发 key(只显示一次)/用量对账/清缓存 | docs/screenshots/admin_web.png(浏览器真渲染) |
+| 5 | **管理界面 + Playground** | 管理台(/admin/web):渠道健康(EMA 实测)5s 自刷/租户/签发 key(只显示一次)/**key 清单+吊销按钮**/用量对账/清缓存;**Playground(/playground)**:SSE 逐字 + TTFT/总延迟/渠道/缓存命中四指标实测 + request_id 徽章 + MISS→HIT 历史(浏览器活体验证:8ms MISS→3ms HIT channel=cache) | docs/screenshots/admin_web.png · playground.png(浏览器真渲染) |
 | 6 | **PolicyCompass 实接** | **真 PC(CRAG,mock LLM)穿网关答题**:OpenAI 请求 → 网关(Lua 准入)→ shim → PC /api/chat;两问 200,937ms/710 字与 889ms/638 字真实语料答案,渠道头 policy-compass,账本落库 | evidence/pc_gateway.md;scripts/demo_pc_gateway.py |
 
 - 实接踩坑记录(诚实):①PC 路由挂 `/api` 前缀(/health 404 → /api/health);②PC 必须用系统 python

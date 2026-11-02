@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>agentgate Playground</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --line:#21262d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; padding:24px; }
+  h1 { font-size:20px; } h1 span { color:var(--acc); }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
+  .wrap { display:grid; grid-template-columns:380px 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .card h2 { font-size:13px; color:var(--acc); margin-bottom:8px; }
+  label { font-size:12px; color:var(--dim); display:block; margin:8px 0 2px; }
+  input, textarea, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; font-family:inherit; }
+  textarea { min-height:64px; resize:vertical; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px; margin-top:10px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin:10px 0; }
+  .metric { background:#0d1117; border:1px solid var(--line); border-radius:6px; padding:8px; }
+  .metric b { display:block; font-size:16px; color:var(--acc); }
+  .metric span { font-size:11px; color:var(--dim); }
+  #out { background:#0d1117; border:1px solid var(--line); border-radius:6px; padding:12px; min-height:220px; white-space:pre-wrap; font-family:Consolas,monospace; font-size:13px; }
+  .cursor { display:inline-block; width:8px; height:14px; background:var(--acc); animation:blink 1s infinite; vertical-align:text-bottom; }
+  @keyframes blink { 50% { opacity:0; } }
+  .hist { font-size:12px; color:var(--dim); margin-top:8px; }
+  .pill { padding:1px 8px; border-radius:10px; font-size:11px; background:rgba(88,166,255,.15); color:var(--acc); display:inline-block; margin-left:6px; }
+</style>
+</head>
+<body>
+  <h1>agentgate <span>Playground</span></h1>
+  <div class="sub">穿过全链路试玩:鉴权 → Lua 准入 → 渠道调度 → SSE 流式 → 异步记账。所有头部与延迟都是实测。</div>
+  <div class="wrap">
+    <div>
+      <div class="card">
+        <h2>请求参数</h2>
+        <label>API Key(ag- 开头;可在管理台签发)</label>
+        <input id="key" placeholder="ag-...">
+        <label>模型</label>
+        <select id="model"></select>
+        <label>Question</label>
+        <textarea id="q">用一句话介绍你自己</textarea>
+        <div class="row">
+          <label style="margin:10px 0 0"><input type="checkbox" id="stream" checked> 流式(SSE)</label>
+          <label style="margin:10px 0 0 12px"><input type="checkbox" id="usage"> 携带 include_usage</label>
+        </div>
+        <button id="send" onclick="send()">发送</button>
+        <button style="background:transparent;border:1px solid var(--line)" onclick="loadModels()">刷新模型</button>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h2>实测指标</h2>
+        <div class="metrics">
+          <div class="metric"><b id="mTTFT">—</b><span>TTFT(ms)</span></div>
+          <div class="metric"><b id="mTotal">—</b><span>总延迟(ms)</span></div>
+          <div class="metric"><b id="mChan">—</b><span>渠道</span></div>
+          <div class="metric"><b id="mCache">—</b><span>缓存</span></div>
+        </div>
+        <div class="metric" style="margin-top:8px"><b id="mTok" style="font-size:13px">—</b><span>usage(prompt/completion/total)</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>输出 <span id="reqId" class="pill"></span></h2>
+      <div id="out">点击「发送」,观察逐字流式与右侧指标。</div>
+      <div id="hist" class="hist"></div>
+    </div>
+  </div>
+
+<script>
+const $ = s => document.querySelector(s);
+let history = [];
+
+async function loadModels(){
+  try {
+    const r = await fetch('/v1/models');
+    const d = await r.json();
+    $('#model').innerHTML = d.data.map(m => `<option>${m.id}</option>`).join('');
+  } catch(e) { $('#model').innerHTML = '<option>(服务未就绪)</option>'; }
+}
+
+function setMetric(id, v){ $(id).textContent = v; }
+
+async function send(){
+  const key = $('#key').value.trim();
+  if (!key) { $('#out').textContent = '请先粘贴 API key(管理台签发)'; return; }
+  const stream = $('#stream').checked;
+  $('#send').disabled = true;
+  $('#out').textContent = '';
+  setMetric('#mTTFT','—'); setMetric('#mTotal','—'); setMetric('#mChan','—'); setMetric('#mCache','—'); setMetric('#mTok','—');
+  const t0 = performance.now();
+  let ttft = null, out = '';
+
+  const body = { model: $('#model').value, messages: [{ role:'user', content: $('#q').value }] };
+  if (stream) { body.stream = true; if ($('#usage').checked) body.stream_options = { include_usage: true }; }
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    setMetric('#mChan', resp.headers.get('x-upstream-channel') || '—');
+    setMetric('#mCache', resp.headers.get('x-cache') || 'BYPASS');
+    $('#reqId').textContent = 'request_id: ' + (resp.headers.get('x-request-id') || '');
+
+    if (!stream) {
+      const d = await resp.json();
+      if (d.error) { $('#out').textContent = '错误: ' + JSON.stringify(d.error); return; }
+      out = d.choices[0].message.content || '';
+      $('#out').textContent = out;
+      setMetric('#mTok', `${d.usage?.prompt_tokens??0}/${d.usage?.completion_tokens??0}/${d.usage?.total_tokens??0}`);
+      setMetric('#mTotal', (performance.now()-t0).toFixed(0));
+      history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), cache: resp.headers.get('x-cache')||'BYPASS' });
+      renderHist();
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', usage = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      if (ttft === null && buf.includes('data:')) { ttft = performance.now() - t0; setMetric('#mTTFT', ttft.toFixed(0)); }
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const evt = JSON.parse(payload);
+          const delta = evt.choices?.[0]?.delta?.content;
+          if (delta) { out += delta; $('#out').innerHTML = escapeHtml(out) + '<span class="cursor"></span>'; }
+          if (evt.usage) usage = evt.usage;
+          if (evt.error) $('#out').textContent += '\n[stream error] ' + evt.message;
+        } catch(_) {}
+      }
+    }
+    $('#out').textContent = out;
+    setMetric('#mTotal', (performance.now()-t0).toFixed(0));
+    if (usage) setMetric('#mTok', `${usage.prompt_tokens??0}/${usage.completion_tokens??0}/${usage.total_tokens??0}`);
+    history.unshift({ q: $('#q').value, ms: (performance.now()-t0).toFixed(0), ttft: ttft?.toFixed(0), cache: resp.headers.get('x-cache')||'BYPASS' });
+    if (history.length > 6) history.pop();
+    renderHist();
+  } catch (e) {
+    $('#out').textContent = '请求失败: ' + e.message;
+  } finally {
+    $('#send').disabled = false;
+  }
+}
+
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function renderHist(){
+  $('#hist').innerHTML = '最近:' + history.map(h =>
+    `<div>${h.q.slice(0,18)}… · ${h.ms}ms${h.ttft? ' · TTFT '+h.ttft+'ms':''} · ${h.cache}</div>`).join('');
+}
+loadModels();
+</script>
+</body>
+</html>

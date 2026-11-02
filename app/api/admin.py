@@ -195,3 +195,31 @@ async def list_tenants(request: Request) -> dict:
 
         rows = (await db.execute(select(T.id, T.name, T.webhook_url).order_by(T.created_at))).all()
         return {"tenants": [{"id": r[0], "name": r[1], "webhook_url": r[2]} for r in rows]}
+
+
+@router.get("/tenants/{tenant_id}/keys")
+async def list_keys(tenant_id: str, request: Request) -> dict:
+    """租户的 key 清单(只有前缀与元数据,无 raw key —— 哈希存储纪律)。"""
+    _require_admin(request)
+    async with request.app.state.session_factory() as db:
+        from sqlalchemy import select
+
+        from app.db.models import VirtualKey as K
+
+        rows = (
+            await db.execute(
+                select(K.id, K.key_prefix, K.name, K.rpm_limit, K.tpm_limit, K.budget_tokens, K.is_active)
+                .where(K.tenant_id == tenant_id)
+                .order_by(K.created_at)
+            )
+        ).all()
+        return {
+            "keys": [
+                {
+                    "key_id": r[0], "prefix": r[1], "name": r[2],
+                    "rpm_limit": r[3], "tpm_limit": r[4],
+                    "budget_tokens": r[5], "is_active": r[6],
+                }
+                for r in rows
+            ]
+        }

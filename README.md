@@ -26,6 +26,11 @@
 
 ![管理台](docs/screenshots/admin_web.png)
 
+**Playground 试玩台**(`/playground`):贴上 key 即可现场穿过全链路——SSE 逐字输出、
+TTFT/总延迟/渠道/缓存命中四指标实测显示、request_id 徽章、历史轨迹(MISS→HIT 一目了然)。
+
+![Playground](docs/screenshots/playground.png)
+
 ## 快速开始
 
 ```bash
