@@ -6,7 +6,7 @@
 
 ## Q1 技术栈是什么?
 
-**一句话**:"Python 3.12 + FastAPI/uvicorn 做接入层,Redis 承担全部跨请求状态(限流/鉴权缓存/渠道路由/队列),PostgreSQL 做账本,观测用 Prometheus+Grafana,部署是 Docker Compose,CI 是 GitHub Actions——双数据库方言 55+55 测试全绿。"
+**一句话**:"Python 3.12 + FastAPI/uvicorn 做接入层,Redis 承担全部跨请求状态(限流/鉴权缓存/渠道路由/队列),PostgreSQL 做账本,观测用 Prometheus+Grafana,部署是 Docker Compose,CI 是 GitHub Actions——双数据库方言 67+67 测试全绿。"
 
 展开(按请求链路说,不是背清单):一个请求进来——request_id 注入(纯 ASGI 中间件,
 选它不用 BaseHTTPMiddleware 是因为 LiteLLM 实测后者吞 44% 吞吐)→ virtual key 鉴权
@@ -34,7 +34,7 @@ TPM 读数+预算读数)→ 渠道调度(冷却状态机+EMA 延迟路由)→ ht
 **一句话**:"我的数据分三层,每层来源我都能说清——而且 mock 和 real 的口径我严格分列。"
 
 - **网关自身的运行数据**(账本/计数/渠道健康):来自真实请求,不是造的;
-- **上游两条口径**:测试与演示走 mock 上游(免费、确定性,让 55 项测试可重复);
+- **上游两条口径**:测试与演示走 mock 上游(免费、确定性,让 67 项测试可重复);
   真实口径是 DashScope qwen-flash 冒烟——过网关答题 31/35 token,**花费约 ¥0.00005,
   有 usage 账单**;
 - **接入的两个 Agent 应用**:AskBI 的答案来自它自己的电商 mock 数据集(3.1 万小票,

@@ -9,7 +9,7 @@
 virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理、故障转移和 Streams
 异步任务。它是 IO 密集型系统——瓶颈在上游模型的秒级延迟,所以我用 Python/FastAPI,
 压测的每请求附加开销是 3.7 毫秒;多进程水平扩展 1→4 worker 是 4.04 倍近线性,因为共享
-状态全部在 Redis。41 项测试双数据库口径全绿,真实 PolicyCompass 已经接在它后面跑。"
+状态全部在 Redis。67 项测试双数据库口径全绿,真实 PolicyCompass 已经接在它后面跑。"
 
 ## 1. 高频问题 → 深挖点 → 证据
 
@@ -20,7 +20,7 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 
 ### Q2 限流怎么保证不多发?
 - 一句话:令牌桶检查+扣减在一段 Lua 里,EVALSHA 原子执行;Redis 单线程保证零竞态。
-- 深挖:①为什么必须 Redis——单机内存限流 N 副本放大 N 倍(LiteLLM redis_requirements 记载);②为什么令牌桶不是固定窗口——平滑、支持突发;③测试"并发 100 恰放行 50"是硬上界证据;④TPM 是另一套:60s 固定窗口计数器,诚实说窗口交界 ~2× 的局限,滑动窗口在 backlog。
+- 深挖:①为什么必须 Redis——单机内存限流 N 副本放大 N 倍(LiteLLM redis_requirements 记载);②为什么令牌桶不是固定窗口——平滑、支持突发;③测试"并发 100 恰放行 50"是硬上界证据;④TPM 是另一套:双窗口加权滑动近似(O(1) 两键轮转,消除固定窗口交界 ~2× 突刺;仍有上一窗瞬时贡献的误差上界,精确滑动日志在 backlog)。
 - 证据:test_bucket_concurrent_zero_oversell;test_m1_ratelimit。
 
 ### Q3 消息/任务不丢不重怎么实现?
@@ -45,7 +45,7 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 
 ### Q7 数据一致性?(Redis 计数 vs PG 账本)
 - 一句话:Redis 是快路径计数,PG 账本是最终事实;计数丢失从账本重建(rebuild_from_db 有测试)。
-- 深挖:预算是计量制(post-response 原子 INCRBY,在途突发最多超出"在途数×单请求 token",诚实说这不是硬上界;硬上界是限流桶);单写者批量落库(请求路径零 DB 写),落库失败不阻塞网关、有可观测事件。
+- 深挖:预算是计量制(post-response 原子 Lua(预算+TPM 同一次),在途突发最多超出"在途数×单请求 token",诚实说这不是硬上界;硬上界是限流桶);账本经 Streams 持久队列落库(请求路径零 DB 写)——outbox 水位补投消除"DB 已提交但 XADD 失败"的双写空洞,`(tenant_id, request_id)` UNIQUE + 消费端原子抢占保证崩溃重投最多一行、不跨租户误吞(幂等键带租户域)。
 - 证据:test_budget_rebuild_from_db;test_concurrent_accounting_atomic(100 并发恰 1800)。
 
 ### Q8 多副本/水平扩展?
@@ -63,10 +63,10 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 
 ## 2. 诚实边界(主动说,反而是加分)
 
-1. 响应缓存是精确匹配不是语义缓存(语义缓存=Higress 方向,backlog);TTL 惰性失效无主动作废。
-2. TPM 固定 60s 窗口,交界可能 ~2×;滑动窗口/令牌桶化在 backlog。
+1. 响应缓存是精确匹配;语义缓存为可插拔 embedder(测试 HashEmbedder=词面 bigram 仅开发口径,生产 DashScope embedding;pgvector/RediSearch KNN 在 backlog)。
+2. TPM 已升级双窗口加权滑动近似(消除固定窗口突刺);精确滑动日志在 backlog。
 3. 预算是计量制不是预扣制;严格预扣需要估算 token,误差同样存在——取舍写在 ADR-002。
-4. SQLite 是测试方言,生产 PG;双口径 41+41 全绿,PG 分区等特性在 backlog。
+4. SQLite 是测试方言,生产 PG;双口径 67+67 全绿(pgserver 内嵌 PG 16.2 复跑),PG 分区等特性在 backlog。
 5. PC 接入的 shim 不上报 usage(PC 无 token 计量),账本 token=0 是诚实记录不是缺陷。
 6. 管理台无鉴权 UI 层(admin_token 保护 API,页面本身内网用);生产加 SSO 在 backlog。
 

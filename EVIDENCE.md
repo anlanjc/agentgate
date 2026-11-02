@@ -6,12 +6,13 @@
 
 ## ① 测试证据
 
-- **57/57 全绿(SQLite 方言)+ 57/57 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,含 OTel 批次)
+- **67/67 全绿(SQLite 方言)+ 67/67 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,AG-2 终态)
   - 命令:`.venv/Scripts/python -m pytest tests -q`;PG 口径:`AGENTGATE_TEST_PG=1` 同命令
-  - 组成:M0 协议代理 13 · M1 鉴权/限流/配额 15 · M2 故障转移/Streams 8 · M4 渠道注册 1 · M5 缓存 5 · 语义 5 · MCP 1 · M6 持久化/双副本 3 · 观测/杂项 4
+  - 组成:M0 协议代理 12 · M1 鉴权 7+限流 7+配额 8 · M2 故障转移 6+Streams 7 · M4 渠道注册 1 · M5 缓存 7+语义 6+MCP 1 · M6 持久化 3+追踪 2
   - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
   - 故障注入面:进程内 mock 上游(429/500/慢/断流)+ 真实 TCP(装死→读超时、discard→拒连、abort→RST 重置)+ 关 Redis(路由降级)
-- **Alembic 迁移在真 PostgreSQL 验证通过**:`scripts/verify_pg_migration.py`(evidence/pg_migration.txt)——upgrade head + 5 表齐全;幂等可重跑
+  - **PG 口径排雷记录**:hardening 批次首跑 PG 14 failed——根因非方言 bug,是 `.pgdata` 持久库旧 schema 残留(`create_all` 只建缺失表不改已有表,`published_at` 类新列跨 run 缺失)。修复=conftest 会话开始按当前模型 drop_all+create_all 重建;迁移正确性由 verify_pg_migration.py 独立验证(职责分离)。**教训:持久测试库 + create_all = schema 漂移假失败,任何"模型演进后 PG 全红"先查 schema 再查代码。**
+- **Alembic 迁移在真 PostgreSQL 验证通过(含 hardening 迁移)**:`scripts/verify_pg_migration.py`(evidence/pg_migration.txt)——upgrade head + 5 表齐全 + 7c1f4a9b2d10 产物(published_at/渠道超时列/key_id 可空/唯一约束)+ 幂等重跑
 
 ## ② 核心验收数字(对照 PROGRESS 里程碑)
 
@@ -110,7 +111,36 @@
 
 ## ⑦ 留给用户
 
-1. Docker 就绪后:`cd deploy && docker compose up -d` → 同套测试在 PG/Redis7 复跑(补 §④ 数字)
-2. 三仓 push(CI 含真 Redis 服务容器)
-3. M4(下一窗口):AskBI/PolicyCompass 注册为网关渠道(自家网关管自家 Agent)+ MCP server 暴露
-4. 可选:Grafana 面板 JSON、PG 账单表按月分区、滑动窗口 TPM
+1. Docker 就绪后:`cd deploy && docker compose up -d` → 同套测试在 PG/Redis7 容器拓扑复跑(§④ compose 口径;pgserver 内嵌 PG 口径已复)
+2. 四仓 push(序 agenteval→askbi→policy→agentgate;CI 含真 Redis/PG 服务容器 + Docker build job)
+3. AskBI 注册为网关渠道(shim 模板已备,需开放跨项目改动)
+4. 可选:PG 账单表按月分区、精确滑动日志 TPM
+
+## ⑧ hardening 批次(2026-11-03,AG-2)——审计驱动,15 项修复分 6 笔入库
+
+> 背景:ds-update 轮对全项目做生产审计(27 文件),AG-2 会话逐块复核后锁存(01b781f→cd22cab)。
+> 本节是"审计→修复→回归"的完整记录;每条主张都有对应测试。
+
+| # | 审计发现 | 修复 | 回归证据 |
+|---|---|---|---|
+| 1 | 流式指标记在构造 StreamResponse 时(TTFT/usage 恒 None/0,看板假数据) | 指标挪 relay finally(流真正结束后记一次);状态区分 200/502/499;账本记真实总延迟 | test_m1 全量回归 |
+| 2 | 流式不传 include_usage 时账本记 0 token | 计费模式强制注入 stream_options.include_usage | test_stream_without_include_usage_is_still_billed(18 token) |
+| 3 | 缓存把缺省 temperature 当确定性(OpenAI 缺省 1.0,随机答案被缓存) | 显式 temperature≤0 才入缓存;缓存键加 user | test_m5_cache 更新(缺省温度不缓存) |
+| 4 | 语义缓存不绑 system prompt(同问题不同上下文串答案) | context_digest(模型+历史+采样参数+user)入索引 | test_m5_semantic(context 隔离) |
+| 5 | XACK 后不 XDEL,backlog 只增不减(误导 /ready 与 Grafana,Stream 无限涨) | ACK 后 XDEL;backlog=真实待处理量 | test_m2_streams(xlen==0 断言) |
+| 6 | 消费端可能重复执行同一 task_id(双消费者竞态) | 条件 UPDATE 原子抢占(pending 或超 visibility timeout 才可领取);visibility 500ms→30s | test_worker_processes_once_and_dedupes_redelivery |
+| 7 | DB 提交后 XADD 失败丢任务(双写空洞) | transactional outbox:published_at 水位 + sweeper 补投 | 迁移产物真 PG 验证;专项注入测试在 P0-C |
+| 8 | 崩溃重投账本重复;request_id 可跨租户伪造吞账本(计费 DoS) | `(tenant_id, request_id)` UNIQUE + 先查再写捕 IntegrityError;幂等键带租户域 usage:{tenant}:{rid} | test_duplicate_ledger_delivery_writes_once / test_same_request_id_across_tenants_does_not_collide |
+| 9 | 纯代理模式 key_id="anonymous" 撞 PG 外键(usage_write 进死信) | key_id 可空,记 NULL | 迁移产物验证(is_nullable=YES) |
+| 10 | 预算 INCRBY 与 TPM 窗口非原子(半成功中间态) | 合并单 Lua(预算+TPM 一次原子更新) | account_tokens 单测回归 |
+| 11 | 渠道注册不按 model 过滤(无关模型命中声明渠道) | candidates(model) 过滤;空 models=兼容全部 | test_m4 回归 |
+| 12 | 渠道超时配置重启丢失 | channels 表 connect/read_timeout 持久化,启动恢复 | test_channel_registry_survives_restart |
+| 13 | admin token 非常量时间比较;/admin/channels 无鉴权;重复租户 500;管理台动态内容无转义 | secrets.compare_digest;channels GET 需 token;409;HTML 转义+token 输入(sessionStorage) | test_m1_auth 回归 |
+| 14 | MCP 渠道名拿 settings.models(模型名)冒充 | 从 channels 表读(与 admin API 同源);签发 key 校验租户 | test_m5_mcp(真子进程握手) |
+| 15 | 部署卫生:requirements 缺 OTel/MCP/aiohttp/pgserver;Dockerfile root;compose 默认 token | 依赖补齐;非 root+healthcheck+.dockerignore;compose 禁默认 token;CI 加 PG 迁移步骤+Docker build job | CI 配置审查(Docker build 待 push 后首跑) |
+
+- **PG 口径排雷**:首跑 14 failed → 根因 `.pgdata` schema 漂移(见 §①)→ conftest 会话重建 → 62 passed。
+- **文档口径统一(本批完成)**:README/PROJECT_BOOK/PITCH 全部对齐 62×2 与现行设计(TPM 双窗口/Streams 记账/outbox/租户域幂等);Grafana 面板同步(USAGE_DROPPED→TASKS_DEAD,队列积压语义更新)。
+- **Redis 故障语义(P0-C,定义+测试)**:准入 fail-closed(RedisError→503 admission_unavailable+Retry-After,计费硬上界宁可拒不可漏)/ 鉴权降级直查 DB(事实来源,缓存读/回填失败不阻塞)/ 响应与语义缓存降级当 miss(优化非正确性)。三条故障面独立,各有测试(test_redis_down_admission_fails_closed / test_redis_down_auth_degrades_to_db / test_cache_redis_error_degrades_to_miss)。
+- **outbox 双向注入(P0-C)**:XADD 抛异常→published_at 为空→sweeper 补投→消费一次(test_outbox_sweeper_republishes_after_xadd_failure);水位丢失(已投递未消费窗口)→重复投递→状态机幂等吞掉、两条消息都 ACK+DEL(test_marker_loss_republishes_but_consumes_once)。
+- **诚实边界(剩余)**:压测 3.70ms/4.04x 为 hardening 前口径,P1 重测后更新;水位丢失场景若发生在"已消费后"(status=done),sweeper 不补投 —— 这是正确设计(账本已落),补投只服务 pending 窗口。
