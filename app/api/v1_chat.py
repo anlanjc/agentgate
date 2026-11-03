@@ -70,7 +70,8 @@ def _classify_upstream_exc(exc: Exception) -> tuple[int, str, str]:
 
 
 async def _dispatch_non_stream(
-    state, payload: dict, headers: dict
+    state, payload: dict, headers: dict,
+    trace_ctx=None, captured: dict | None = None,
 ) -> tuple[str | None, httpx.Response]:
     """按候选顺序尝试;返回 (channel_name|None, response)。
 
@@ -83,20 +84,24 @@ async def _dispatch_non_stream(
     for name in await r.candidates(model):
         client = r.client(name)
         t0 = time.perf_counter()
+        tracer = r_tracer(state)
         span_ctx = (
-            r_tracer(state).start_as_current_span(
+            tracer.start_as_current_span(
                 "gateway.upstream",
                 attributes={
                     "gateway.channel": name,
                     "gateway.model": model,
                     "gateway.request_id": current_request_id(),
                 },
+                context=trace_ctx,
             )
-            if r_tracer(state) else nullcontext()
+            if tracer else nullcontext()
         )
         try:
             with span_ctx as span:
-                resp = await client.chat_completion(payload, extra_headers=headers)
+                resp = await client.chat_completion(
+                    payload, extra_headers=_with_traceparent(headers, captured, tracer)
+                )
                 if span:
                     span.set_attribute("http.status_code", resp.status_code)
         except UPSTREAM_TRANSPORT_ERRORS as exc:
@@ -126,7 +131,8 @@ async def _dispatch_non_stream(
 
 
 async def _dispatch_stream(
-    state, payload: dict, headers: dict
+    state, payload: dict, headers: dict,
+    trace_ctx=None, captured: dict | None = None,
 ) -> tuple[str | None, httpx.Response, bool]:
     """返回 (channel|None, resp, opened)。opened=False 时 resp 已读完(合成/错误响应)。"""
     r: ChannelRouter = state.channel_router
@@ -136,20 +142,24 @@ async def _dispatch_stream(
     for name in await r.candidates(model):
         client = r.client(name)
         t0 = time.perf_counter()
+        tracer = r_tracer(state)
         span_ctx = (
-            r_tracer(state).start_as_current_span(
+            tracer.start_as_current_span(
                 "gateway.upstream_stream",
                 attributes={
                     "gateway.channel": name,
                     "gateway.model": model,
                     "gateway.request_id": current_request_id(),
                 },
+                context=trace_ctx,
             )
-            if r_tracer(state) else nullcontext()
+            if tracer else nullcontext()
         )
         try:
             with span_ctx as span:
-                resp = await client.open_stream(payload, extra_headers=headers)
+                resp = await client.open_stream(
+                    payload, extra_headers=_with_traceparent(headers, captured, tracer)
+                )
                 if span:
                     span.set_attribute("http.status_code", resp.status_code)
         except UPSTREAM_TRANSPORT_ERRORS as exc:
@@ -268,6 +278,29 @@ async def _admit(request: Request, auth: AuthResult, model: str) -> AdmitResult:
                 "concurrency_exceeded", retry_after_s=1,
             )
     return r
+
+
+def _with_traceparent(headers: dict, captured: dict | None, tracer=None) -> dict:
+    """W3C 注入(P4-2):追踪启用且调用方没带 traceparent 时,从当前 span 生成
+    一条给上游(跨服务 trace 连续);调用方带了则原样透传并回记(响应头回传)。
+
+    门控用 app 自己的 tracer(而非模块全局):FastAPI 0.162+ 原生 telemetry 会在
+    全局 provider 存在时自动开 span —— 本 app 关闭追踪时不能被别的进程态污染。
+    """
+    if tracer is None:
+        return headers
+    if "traceparent" in headers:
+        if captured is not None:
+            captured["traceparent"] = headers["traceparent"]
+        return headers
+    from opentelemetry.propagate import inject
+
+    carrier: dict = {}
+    inject(carrier)  # 当前 span 上下文 → 新 span id,同一 trace
+    tp = carrier.get("traceparent")
+    if tp and captured is not None:
+        captured["traceparent"] = tp
+    return {**headers, "traceparent": tp} if tp else headers
 
 
 def _rate_limit_headers(auth: AuthResult | None, r: AdmitResult | None) -> dict:
@@ -465,10 +498,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 
             idem_sk = idempotency.storage_key(auth.tenant_id, auth.key_id, raw_idem)
 
+    # ---- W3C Trace Context(P4-2):client traceparent 提取为父上下文;响应头回传 ----
+    from app.observability import tracing as otel_tracing
+
+    trace_ctx = (
+        otel_tracing.incoming_context(request.headers) if r_tracer(state) else None
+    )
+    captured: dict = {"traceparent": None}
+
     # ---- 流式:先调度渠道并开流(连接类异常发生在状态码提交前,可安全映射)----
     if req.stream:
         try:
-            channel, resp, opened = await _dispatch_stream(state, payload, forward_headers)
+            channel, resp, opened = await _dispatch_stream(
+                state, payload, forward_headers, trace_ctx, captured
+            )
         except UPSTREAM_TRANSPORT_ERRORS as exc:
             status, message, code = _classify_upstream_exc(exc)
             logger.warning("upstream_transport_error", error=str(exc), status=status)
@@ -557,6 +600,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 "X-Accel-Buffering": "no",
                 "x-upstream-channel": channel or "exhausted",
                 **rl_headers,
+                **({"traceparent": captured["traceparent"]} if captured.get("traceparent") else {}),
             },
             background=BackgroundTask(_account, request, auth, make_record),
         )
@@ -588,7 +632,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     try:
         return await _non_stream_core(
             req, request, state, payload, request_id, request_t0, auth, idem_sk,
-            forward_headers, rl_headers,
+            forward_headers, rl_headers, trace_ctx, captured,
         )
     finally:
         if idem_sk is not None:
@@ -601,6 +645,7 @@ async def _non_stream_core(
     req: ChatCompletionRequest, request: Request, state, payload: dict,
     request_id: str, request_t0: float, auth: AuthResult | None,
     idem_sk: str | None, forward_headers: dict, rl_headers: dict | None = None,
+    trace_ctx=None, captured: dict | None = None,
 ) -> Response:
     """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。"""
     from app import idempotency
@@ -697,7 +742,9 @@ async def _non_stream_core(
         metrics.CACHE_MISSES.inc()
 
     try:
-        channel, resp = await _dispatch_non_stream(state, payload, forward_headers)
+        channel, resp = await _dispatch_non_stream(
+            state, payload, forward_headers, trace_ctx, captured
+        )
     except UPSTREAM_TRANSPORT_ERRORS as exc:
         if sf_acquired:
             await response_cache.release(state.redis, rkey)
@@ -747,6 +794,8 @@ async def _non_stream_core(
     if sf_acquired:
         await response_cache.release(state.redis, rkey)  # 非 200 未填缓存:兜底释放
     extra_headers = {"x-upstream-channel": channel or "exhausted", **(rl_headers or {})}
+    if captured and captured.get("traceparent"):
+        extra_headers["traceparent"] = captured["traceparent"]
     if rkey is not None:
         extra_headers["x-cache"] = "MISS"
     if idem_sk is not None and 200 <= resp.status_code < 300 and body_json is not None:

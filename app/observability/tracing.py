@@ -63,3 +63,46 @@ def setup_tracing(settings: Settings, exporter=None):
 
 def get_tracer():
     return _tracer
+
+
+# ---------- W3C Trace Context 提取/注入(P4-2:trace 跨服务连续) ----------
+
+import re
+
+_TP_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
+
+
+def _valid_traceparent(value: str | None) -> str | None:
+    """W3C traceparent 语法校验(版本 ff 非法/长度/hex);非法返回 None,不猜。"""
+    if not value:
+        return None
+    v = value.strip().lower()
+    if not _TP_RE.match(v) or v.startswith("ff-"):
+        return None
+    return v
+
+
+def incoming_context(headers):
+    """client traceparent → OTel Context(网关 span 挂到调用方 trace 上)。
+
+    追踪未启用或头非法 → None(span 照常独立建,行为与从前一致)。
+    """
+    if get_tracer() is None:
+        return None
+    v = _valid_traceparent(headers.get("traceparent"))
+    if v is None:
+        return None
+    from opentelemetry.propagate import extract
+
+    return extract({"traceparent": v})
+
+
+def current_traceparent() -> str | None:
+    """当前 span 的 traceparent(响应头回传/子调用注入用);无活动 span 返回 None。"""
+    if get_tracer() is None:
+        return None
+    from opentelemetry.propagate import inject
+
+    carrier: dict = {}
+    inject(carrier)
+    return carrier.get("traceparent") or None
