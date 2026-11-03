@@ -1,0 +1,23 @@
+# 水平扩容(P4-3):网关无状态(状态全在 Redis/PG),副本数按 CPU 伸缩;
+# 上限与限流容量、上游配额一起规划 —— 扩容不是免费的(每副本都是限流域的一员)。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agentgate
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agentgate
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 防抖:缩容等 5 分钟(流式长连接在途)

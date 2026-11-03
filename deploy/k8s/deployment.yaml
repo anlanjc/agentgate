@@ -1,0 +1,55 @@
+# 网关部署(P4-3):非 root 镜像、双探针、资源界限;副本扩容安全性依赖
+# "共享状态全在 Redis"(限流/路由/鉴权缓存多副本一致,README 硬点 #2 有实测)。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgate
+  labels:
+    app: agentgate
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agentgate
+  template:
+    metadata:
+      labels:
+        app: agentgate
+      annotations:
+        # 变更 secret/configmap 时手动 bump 触发滚动(简化,未引入 reloader)
+        checksum/config: "1"
+    spec:
+      securityContext:
+        runAsNonRoot: true  # 与 Dockerfile 非 root 一致
+      containers:
+        - name: gateway
+          image: agentgate:latest  # CI docker-build job 产物;按仓库替换
+          ports:
+            - containerPort: 8100
+          envFrom:
+            - configMapRef:
+                name: agentgate-config
+            - secretRef:
+                name: agentgate-secret
+          readinessProbe:
+            httpGet:
+              path: /ready   # Redis ping + DB select + 队列积压
+              port: 8100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # alembic 迁移期无需写 FS;如需加固配合 emptyDir

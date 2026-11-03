@@ -1,0 +1,15 @@
+# agentgate 非敏感配置(P4-3;敏感项见 secret.yaml)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-config
+  labels:
+    app: agentgate
+data:
+  AGENTGATE_UPSTREAM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  AGENTGATE_DB_URL: "postgresql+asyncpg://agentgate: REPLACE-VIA-SECRET@pg-host:5432/agentgate"
+  AGENTGATE_REDIS_URL: "redis://redis-host:6379/0"
+  AGENTGATE_LLM_TRUST_ENV: "false"
+  AGENTGATE_OTEL_ENABLED: "true"
+  AGENTGATE_OTEL_EXPORTER: "otlp"
+  AGENTGATE_OTEL_OTLP_ENDPOINT: "http://otel-collector:4317"
