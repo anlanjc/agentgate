@@ -19,14 +19,18 @@
 
 ## 验收数字(EVIDENCE.md 有完整口径)
 
-- **每请求附加开销 3.70ms**(c=1 无排队口径;<10ms 达标)
-- **多进程水平扩展 1.00x → 2.15x → 4.04x**(workers 1/2/4,共享状态全在 Redis)
+- **每请求附加开销 3.55ms**(c=1 无排队口径;<10ms 达标;hardening 批次后重测)
+- **多进程水平扩展 1.00x → 2.09x → 4.95x**(workers 1/2/4,共享状态全在 Redis)
 - **并发 100 限流扣减恰好放行 50**(容量 50,硬上界零超卖)
 - **并发 100 记账恰好 1800 token**(原子 INCRBY 零丢失)、账本 100 行对账一致
-- **双数据库口径 67+67 全绿**(SQLite + PostgreSQL 16.2 真库,Alembic 迁移真 PG 验证含 7c1f4a9b2d10 hardening 迁移产物)
-- **账本幂等**:`(tenant_id, request_id)` UNIQUE + 消费端原子抢占——崩溃重投最多一行,客户端伪造 request_id 不能吞别家账本(幂等键带租户域)
+- **双数据库口径全绿**:95 passed(SQLite)+ **97 passed(PostgreSQL 16.2)**——pgvector 语义缓存
+  KNN 为 PG 专属口径,SQLite 诚实 skip;Alembic 迁移真 PG 验证
+- **账本幂等**:`(tenant_id, request_id)` UNIQUE + 消费端原子抢占 + outbox 双向故障注入——
+  崩溃重投最多一行,客户端伪造 request_id 不能吞别家账本(幂等键带租户域)
 - **双副本限流一致性实测**:两副本共享 Redis,合并并发 100 × 容量 50 → 恰放行 50(不放大)
+- **kill -9 实测 2047ms 自动切换**(真实多进程演练,含 RST+冷却+重试周期;客户端零感知)
 - **真实 PolicyCompass 已接入**:OpenAI 请求穿网关→shim→PC CRAG 答题(937ms/710 字),自家网关管自家 Agent
+- **DashScope 真冒烟**:非流式 434ms / 流式 TTFT 142ms,账本对账 2 行(实际花费 ≈¥0.00006)
 
 ![管理台](docs/screenshots/admin_web.png)
 
@@ -85,22 +89,25 @@ python scripts/load_test.py --requests 2000 --concurrency 50 --out evidence/load
 
 ```
 app/
-  api/        v1_chat(协议+调度+记账+缓存) · admin(租户/key/渠道/用量/缓存) · main(工厂+管理台)
+  api/        v1_chat(协议+调度+记账+缓存) · admin(租户/key/渠道/用量/账单/审计) · main(工厂+管理台)
   auth/       virtual key 缓存优先鉴权(哈希存储,raw key 只见一次)
-  ratelimit/  Lua 令牌桶 · 准入单脚本(EVALSHA) · 令牌桶独立 consume
-  quota/      预算/TPM 双窗口滑动 · Streams 记账(请求路径零 DB 写)· 账本重建
+  security/   渠道密钥 Fernet 静态加密(prod 强制主密钥;日志/审计面零明文)
+  idempotency.py  客户端 Idempotency-Key:重试回放不重执行不重计费(仅非流式,诚实边界)
+  billing.py  成本模型:单价×token→账本 cost;未登记价格 NULL 不猜
+  ratelimit/  Lua 令牌桶 · 准入单脚本(EVALSHA) · 每 key 并发上限(崩溃泄漏 TTL 有界)
+  quota/      key/租户双级预算(单 Lua 原子)· TPM 双窗口滑动 · Streams 记账 · 账本重建
   router/     渠道注册表 + 冷却/EMA 状态机(Redis 状态,多副本一致)· model 过滤
   queue/      Redis Streams 任务队列(outbox 补投/原子抢占/XACK+XDEL/DLQ)+ webhook 投递器
-  cache/      精确响应缓存(租户隔离键 · 显式 temperature 门控 · TTL 惰性失效)
+  cache/      精确缓存(单飞锁防击穿)· 语义缓存双后端(Redis 暴力余弦 | pgvector KNN/HNSW)
   upstream/   httpx 客户端(trust_env=False)+ SSE 旁观解析(TTFT/usage)
-  observability/  Prometheus 指标(TTFT/token/缓存命中/队列深度)
+  observability/  Prometheus 指标 · OTel span(W3C traceparent 提取/注入/回传)
   mcp_server.py   MCP stdio 工具面(渠道健康/用量/预算/签发 key,与网关共享状态)
   web/        管理台单文件页(/admin/web)
   db/         SQLAlchemy 2.0 方言中立模型 + Alembic
 docs/adr/     ADR-001~005(选型五篇) · docs/PITCH.md 开场五连应答脚本 · docs/handwrite_cards.md 手撕卡三张
 docs/PROJECT_BOOK.md  面试深挖手册(10 问三段式 + 诚实边界 + 演示剧本)
-tests/        67 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/账本幂等/双数据库)
+tests/        95 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/账本幂等/审计/双数据库)
 scripts/      load_test(附加开销口径)· load_workers(扩展曲线)· demo_admin · demo_ecosystem · demo_pc_gateway · smoke_real · verify_pg_migration · agent_shim_example
-deploy/       docker-compose(生产拓扑)
+deploy/       docker-compose(PG16/Redis7/Prometheus/Grafana/Jaeger + SLO 告警规则)· k8s 清单(Deployment/HPA)
 PRODUCTION_GAP.md  上线前差距清单(A 必做/B 应做/C 锦上添花,同 askbi/PC 纪律)
 ```

@@ -139,5 +139,7 @@ async def test_channel_key_encrypted_at_rest_and_usable(auth_settings, redis_cli
         assert resp.status_code == 200
         await app.state.task_queue.stop()
         await app2.state.task_queue.stop()
+        await app.state.engine.dispose()
+        await app2.state.engine.dispose()
     finally:
         server.should_exit = True

@@ -92,6 +92,14 @@ async def _pg_clean(pg_url):
         async with engine.begin() as conn:
             for t in _PG_TABLES:
                 await conn.execute(text(f"TRUNCATE TABLE {t} CASCADE"))
+            # semantic_entries 仅 pgvector 后端测试创建(P4-4):存在才清,缺表跳过
+            exists = (
+                await conn.execute(text(
+                    "select 1 from information_schema.tables where table_name='semantic_entries'"
+                ))
+            ).scalar_one_or_none()
+            if exists:
+                await conn.execute(text("TRUNCATE TABLE semantic_entries"))
     finally:
         await engine.dispose()
 
@@ -179,6 +187,7 @@ async def gateway(settings, redis_client):
         yield client, app, mock_app
     await upstream.aclose()
     await app.state.task_queue.stop()
+    await app.state.engine.dispose()  # PG 口径:连接池不释放会耗尽 max_connections(95+ 测试实测)
 
 
 @pytest.fixture
@@ -204,6 +213,7 @@ async def auth_gateway(auth_settings, redis_client):
         yield client, app, mock_app, raw
     await upstream.aclose()
     await app.state.task_queue.stop()
+    await app.state.engine.dispose()
 
 
 def auth_headers(raw_key: str) -> dict:

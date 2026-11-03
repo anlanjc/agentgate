@@ -82,6 +82,7 @@ async def test_audit_requires_admin_token(tmp_path, redis_client):
         ).status_code == 200
     await upstream.aclose()
     await app.state.task_queue.stop()
+    await app.state.engine.dispose()
 
 
 async def test_audit_same_transaction_as_change(auth_gateway):

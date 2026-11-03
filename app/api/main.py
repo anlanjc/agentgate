@@ -83,6 +83,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app_: FastAPI):
         logger.info("app_started", version=__version__, upstream=settings.upstream_name)
+        # 语义缓存 pgvector 后端(P4-4):幂等建扩展/表/HNSW(维度显式配置)
+        if settings.semantic_cache_enabled and settings.semantic_backend == "pgvector":
+            from app.cache import semantic_pg
+
+            await semantic_pg.ensure_table(app_.state.engine, settings.semantic_pg_vector_dim)
         # 生产启动:从 channels 表恢复渠道注册(运行时注册的重启不丢)
         await load_channels_from_db(app_)
         # 启动 outbox sweeper/消费者;Redis 暂时不可用时由首次 enqueue 惰性重试。

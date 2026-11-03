@@ -641,6 +641,39 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             await idempotency.release(state.redis, idem_sk)
 
 
+async def _semantic_search(state, auth: AuthResult, model: str, ctx: str, question: str):
+    """语义缓存检索后端分发(P4-4):redis 暴力余弦 | pgvector KNN。"""
+    s = state.settings
+    if s.semantic_backend == "pgvector":
+        from app.cache import semantic_pg
+
+        return await semantic_pg.search_pg(
+            state.engine, state.embedder, auth.tenant_id, model, ctx, question,
+            s.semantic_cache_threshold, ttl=s.semantic_cache_ttl,
+            dim=s.semantic_pg_vector_dim,
+        )
+    return await semantic_cache.search(
+        state.redis, state.embedder, auth.tenant_id, model, ctx, question,
+        s.semantic_cache_threshold,
+    )
+
+
+async def _semantic_store(state, auth: AuthResult, model: str, ctx: str, question: str, body_json: dict) -> None:
+    s = state.settings
+    if s.semantic_backend == "pgvector":
+        from app.cache import semantic_pg
+
+        await semantic_pg.store_pg(
+            state.engine, state.embedder, auth.tenant_id, model, ctx, question,
+            body_json, s.semantic_cache_ttl, dim=s.semantic_pg_vector_dim,
+        )
+        return
+    await semantic_cache.store(
+        state.redis, state.embedder, auth.tenant_id, model, ctx, question,
+        body_json, s.semantic_cache_ttl,
+    )
+
+
 async def _non_stream_core(
     req: ChatCompletionRequest, request: Request, state, payload: dict,
     request_id: str, request_t0: float, auth: AuthResult | None,
@@ -709,10 +742,7 @@ async def _non_stream_core(
     if auth is not None and semantic_cache.semantic_enabled(state.settings, req):
         semantic_ctx = semantic_cache.context_digest(req.model, payload)
     if auth is not None and not exact_hit and semantic_ctx is not None and question:
-        hit = await semantic_cache.search(
-            state.redis, state.embedder, auth.tenant_id, req.model, semantic_ctx,
-            question, state.settings.semantic_cache_threshold,
-        )
+        hit = await _semantic_search(state, auth, req.model, semantic_ctx, question)
         if hit is not None:
             if sf_acquired:
                 await response_cache.release(state.redis, rkey)
@@ -779,10 +809,7 @@ async def _non_stream_core(
             and question
             and body_json is not None
         ):
-            await semantic_cache.store(
-                state.redis, state.embedder, auth.tenant_id, req.model, semantic_ctx,
-                question, body_json, state.settings.semantic_cache_ttl,
-            )
+            await _semantic_store(state, auth, req.model, semantic_ctx, question, body_json)
     record = _record(
         auth, req.model, request_id, resp.status_code, usage, None, latency_ms,
         channel=channel or "",

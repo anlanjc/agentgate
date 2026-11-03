@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     semantic_cache_ttl: int = 600
     embed_api_key: str = ""
     embed_api_base: str = ""
+    # P4-4:检索后端 redis(ZSET 暴力余弦,≤200 条) | pgvector(KNN+HNSW,PG 口径;
+    # 开启时 semantic_pg_vector_dim 必须与 embedder 输出维度一致,启动时幂等建表)
+    semantic_backend: str = "redis"
+    semantic_pg_vector_dim: int = 0
 
     # M6:分布式追踪(默认关;console 导出演示/otlp 生产,span 属性含 tenant/model/channel)
     otel_enabled: bool = False

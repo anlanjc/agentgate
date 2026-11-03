@@ -14,13 +14,16 @@
 
 ## B. 应做(真实用户前)
 
+> 2026-11-03 AG-2 P1-P4 批次销账:B2/B3/B4 已完成(标 ✅);管理台 token 输入+审计日志落地(B1 部分),
+> 密钥加密/审计/Idempotency-Key/租户预算/并发上限/单飞锁见 EVIDENCE §⑨。
+
 | # | 项 | 现状 | 触发条件 | 工作量 |
 |---|---|---|---|---|
-| B1 | 管理台鉴权/SSO | 页面内网用,API 有 admin_token | 多人使用 | 1-2d |
-| B2 | 账单导出/对账文件 | admin usage API 有,导出无 | 财务需求 | 0.5d |
-| B3 | 滑动窗口 TPM | 固定 60s 窗口(交界 ~2×,EVIDENCE §⑥) | 计费敏感客户 | 0.5d |
-| B4 | 语义缓存 | 精确匹配缓存 | 高重复问答场景 | 1-2d(向量+阈值) |
-| B5 | 语义缓存失效策略 | TTL 惰性 | 上游答案可变性高 | 1d |
+| B1 | 管理台鉴权/SSO | ✅部分:页面 token 输入(sessionStorage)+审计日志+常量时间比较;SSO 未做 | 多人使用 | SSO 1-2d |
+| B2 | 账单导出/对账文件 | ✅ /admin/tenants/{id}/billing(JSON 汇总+CSV 明细,时间窗) | — | 0 |
+| B3 | 滑动窗口 TPM | ✅ 双窗口加权滑动近似(O(1) 两键轮转);精确滑动日志仍可再进一步 | — | 精确版 0.5d |
+| B4 | 语义缓存 | ✅ 语义缓存双后端:Redis 暴力余弦(默认,≤200 条)+ pgvector KNN/HNSW(PG 口径实测) | — | RediSearch 版按需 |
+| B5 | 语义缓存失效策略 | TTL 惰性(Redis)/查询侧 created_at 过滤(pgvector) | 上游答案可变性高 | 1d |
 | B6 | PG 账单表按月分区 | 单表+created_at 索引 | 账本 > 千万行 | 0.5d(PG 专属迁移分支) |
 | B7 | 渠道协议适配器 | shim 外挂(~60 行/应用) | 接入非 OpenAI 协议应用多 | 1d/协议(Anthropic 等) |
 
@@ -28,10 +31,11 @@
 
 | # | 项 | 说明 |
 |---|---|---|
-| C1 | Grafana 面板 JSON | 指标已暴露,面板手工拖一次导出即可 |
+| C1 | Grafana 面板 JSON | ✅ provisioning 自动加载(TTFT 分位/缓存命中/队列积压/渠道冷却/死信) |
 | C2 | MCP server HTTP transport | 目前 stdio(单机);远程用 SSE transport |
-| C3 | key 用量告警(预算 80% 预警) | webhook 通道已具备,加规则即可 |
-| C4 | AskBI 实接 | PC 已实接;AskBI 同 shim 模式,任务模型映射稍复杂(异步任务表) |
+| C3 | key 用量告警(预算 80% 预警) | ✅部分:SLO 告警规则 6 条已交付(deploy/alerts.yml,Prometheus rule_files);预算百分比预警未做 |
+| C4 | AskBI 实接 | PC 已实接;AskBI 同 shim 模板就绪,**等主人开放跨项目授权** |
+| C5 | K8s 实跑验证 | ✅清单已交付(deploy/k8s:Deployment/Service/HPA);未在真实集群实跑,装 k8s 后核对 |
 
 ## 结论
 
