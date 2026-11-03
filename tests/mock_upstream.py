@@ -56,10 +56,12 @@ def build_mock_upstream(default_case: str = "ok") -> FastAPI:
         stream = bool(body.get("stream"))
 
         if case == "err_429":
+            # Retry-After 5s:给断言留出调度余量(1s 在全量套件负载下会被时间耗尽,
+            # "0 < 剩余 <= 上界"的判别在 5s 窗口下才稳定;仍足以区别 60s 默认冷却)
             return JSONResponse(
                 status_code=429,
                 content={"error": {"message": "rate limited", "type": "rate_limit"}},
-                headers={"Retry-After": "1"},
+                headers={"Retry-After": "5"},
             )
         if case == "err_500":
             return JSONResponse(status_code=500, content={"error": {"message": "boom"}})

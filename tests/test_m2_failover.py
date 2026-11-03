@@ -97,7 +97,8 @@ async def test_429_respects_retry_after(auth_settings, redis_client):
         assert resp.headers["x-upstream-channel"] == "ch-b"
         st = await app.state.channel_router.state_of("ch-a")
         now_ms = int(time.time() * 1000)
-        assert 0 < st["cooldown_until_ms"] - now_ms <= 1000  # 尊重上游 Retry-After,而非默认 60s
+        # 尊重上游 Retry-After(5s),而非默认 60s;上界是核心判别
+        assert 0 < st["cooldown_until_ms"] - now_ms <= 5000
     finally:
         await client.aclose()
         await ua.aclose()

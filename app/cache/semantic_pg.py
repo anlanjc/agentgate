@@ -24,7 +24,7 @@ async def ensure_table(engine, dim: int) -> None:
     if dim <= 0:
         raise ValueError("semantic_pg_vector_dim must be set when backend=pgvector")
     if not isinstance(dim, int):
-        raise ValueError("semantic_pg_vector_dim must be an integer")
+        raise TypeError("semantic_pg_vector_dim must be an integer")
     from sqlalchemy import text
 
     # asyncpg 不支持 DDL 绑定参数:dim 已验证为 int,内联安全
@@ -76,7 +76,7 @@ async def store_pg(engine, embedder, tenant_id: str, model: str, ctx: str,
                 " VALUES (:t, :m, :c, :q, CAST(:a AS jsonb), CAST(:v AS vector))"
             ).bindparams(t=tenant_id, m=model, c=ctx, q=question,
                          a=json.dumps(body, ensure_ascii=False), v=_vec_literal(vec)))
-    except Exception as exc:  # noqa: BLE001 降级:缓存写失败不阻塞请求
+    except Exception as exc:
         logger.warning("semantic_pg_store_degraded", error=str(exc))
 
 
@@ -100,7 +100,7 @@ async def search_pg(engine, embedder, tenant_id: str, model: str, ctx: str,
                 " ORDER BY embedding <=> CAST(:v AS vector) LIMIT :lim"
             ).bindparams(t=tenant_id, m=model, c=ctx, v=_vec_literal(vec),
                          ttl=ttl, lim=max_scan))).all()
-    except Exception as exc:  # noqa: BLE001 降级:PG 故障当 miss
+    except Exception as exc:
         logger.warning("semantic_pg_search_degraded", error=str(exc))
         return None
     if not rows:
