@@ -144,3 +144,47 @@
 - **Redis 故障语义(P0-C,定义+测试)**:准入 fail-closed(RedisError→503 admission_unavailable+Retry-After,计费硬上界宁可拒不可漏)/ 鉴权降级直查 DB(事实来源,缓存读/回填失败不阻塞)/ 响应与语义缓存降级当 miss(优化非正确性)。三条故障面独立,各有测试(test_redis_down_admission_fails_closed / test_redis_down_auth_degrades_to_db / test_cache_redis_error_degrades_to_miss)。
 - **outbox 双向注入(P0-C)**:XADD 抛异常→published_at 为空→sweeper 补投→消费一次(test_outbox_sweeper_republishes_after_xadd_failure);水位丢失(已投递未消费窗口)→重复投递→状态机幂等吞掉、两条消息都 ACK+DEL(test_marker_loss_republishes_but_consumes_once)。
 - **诚实边界(剩余)**:压测 3.70ms/4.04x 为 hardening 前口径,P1 重测后更新;水位丢失场景若发生在"已消费后"(status=done),sweeper 不补投 —— 这是正确设计(账本已落),补投只服务 pending 窗口。
+
+## ⑨ P1-P4 自主推进批次(2026-11-03/04,AG-2)——压测重测+安全三连+部署生态,16 笔提交
+
+> 用户指令:P1-P4 自主完成不停歇。执行序:P1 数字重测 → P2 安全三连+小件 → P3 Jaeger/告警 → P4 成本/trace/K8s/pgvector。
+> 期间抓到的真问题全部修复并回归(压测脚本文件锁/演练建表时序/演练语义过时/真冒烟账本抢跑/PG 连接池泄漏)。
+
+### P1 数字重测(hardening 后新口径,旧数字作废)
+
+| 项 | 旧口径 | 新实测 | 说明 |
+|---|---|---|---|
+| 每请求附加开销 | 3.70ms | **3.55ms** | c=1 差值口径,2000 req @ c=50;达标不变 |
+| 水平扩展 | 1.00→2.15→4.04x | **1.00→2.09→4.95x** | 1500 req × 3 档;4 档超线性来自本机噪声 |
+| kill -9 切换 | 10ms | **2047ms** | 含真实 RST+冷却+重试周期,比旧口径诚实;客户端零感知不变 |
+| DashScope 真冒烟 | — | 非流式 434ms/流式 TTFT 142ms,账本 2 行 | 花费 ≈¥0.00006 |
+
+- **演练抓到语义过时**:hardening 后路由按 model 过滤,"agent-b 兜 agent-a 模型"不再成立(正确收紧)→ 演练改为同模型池双渠道(真实 failover 前提)。
+- **压测/演练脚本 Windows 文件锁根治**:固定 DB 文件被孤儿进程锁死(PermissionError 炸压测)→ 一次性临时 DB;demo 的 init_db 提前到 lifespan 前(一次性新库上渠道恢复撞 no such table,以前全靠旧库已有表)。
+- **真冒烟账本抢跑修复**:记账在 BackgroundTask enqueue,单次 flush 抢跑后硬停丢在途 commit(实测 1/2 行)→ 轮询等齐 2 行;边界注记入库(at-least-once 从 enqueue 起算)。
+
+### P2 安全 hardening(5 笔,安全拷打面收口)
+
+| # | 项 | 要点 | 测试 |
+|---|---|---|---|
+| 1 | 渠道密钥 Fernet 加密 | enc:v1: 前缀;prod 强制主密钥(fail-closed);存量明文兼容;解密失败路由失败不吐垃圾 | 7 项含端到端(注册→DB 密文→重启恢复→真 HTTP) |
+| 2 | admin 审计日志 | audit_logs 只追加(迁移 a3d94f1c7b21);5 动作同事务落审计;raw key/渠道密钥零入审计 | 4 项含同事务回滚 |
+| 3 | Idempotency-Key | 重放不重执行不重计费(账本 channel=replay token=0);在途 409;仅非流式(诚实边界) | 4 项 |
+| 4 | 租户级预算 | tenants.budget_tokens(c8e51b09d447);key/租户预算同一次 Lua INCRBY;换 key 绕不过;60s 缓存窗口诚实标注 | 3 项含跨 key 拦截 |
+| 5 | 三小件 | 限流响应头标准三件;每 key 并发上限(崩溃泄漏 TTL 300s 有界);缓存单飞锁(SETNX 3s+1s 轮询等填) | 3 项 |
+
+### P3/P4 部署与生态
+
+- **P3-17**:compose 接入 Jaeger all-in-one(OTLP)——OTel span 有完整查看端;SLO 告警规则 6 条(deploy/alerts.yml,P1 页/P2 工单;阈值为占位,真实流量后校准)。
+- **P4-1 成本模型**:AGENTGATE_MODEL_PRICES(元/百万 token);账本 cost 列(f9a37c2d5b84)写入点计算;未登记价格 NULL 不猜;账单端点(JSON 汇总+CSV 明细)。测试:按账本实际拆分验证+汇总明细两两对账。
+- **P4-2 W3C traceparent**:提取(非法不猜)/注入(client 未带时从当前 span 生成)/响应头回传;门控用 app 级 state.tracer。**发现 FastAPI 0.162 内置原生 telemetry**(fastapi/telemetry/,全局 provider 存在即自动叠 span)——生产含义:开启 otel 后 Jaeger 可见两层 span(已文档化)。**修测试基建真 bug**:OTel 全局 provider 只能 set 一次,fixture teardown 的 reset_tracing 致后续 exporter 静默收不到 span。
+- **P4-3 K8s 清单**(deploy/k8s):Deployment(2 副本双探针非 root)/Service/HPA(2~10,CPU 70%)/ConfigMap/Secret 模板;有意不含 PG/Redis StatefulSet(托管优先);**未实跑诚实标注**。
+- **P4-4 pgvector 后端**:内嵌 PG 16.2 自带 vector 0.6.2 → 真实现(app/cache/semantic_pg.py):幂等建表+HNSW、KNN 召回、降级当 miss;`semantic_backend=redis|pgvector` 双后端,SQLite 口径诚实 skip。**顺手修 PG 连接池卫生真 bug**:95+ 测试 × 每 app 连接池不释放 → too many clients;fixture teardown 统一 engine.dispose()。
+
+### 终态(2026-11-04,最后提交后复测)
+
+- **SQLite:95 passed + 2 skipped**(pgvector 是 PG 专属口径,skip=诚实标注)
+- **PostgreSQL 16.2:97 passed**(含 pgvector KNN 往返+租户隔离)
+- ruff 全绿;Alembic 迁移链 3215fe6889f5→7c1f4a9b2d10→a3d94f1c7b21→c8e51b09d447→e6f22c81a903→f9a37c2d5b84 真 PG 验证
+- git:main 分支 22 笔提交(自 747f471 起),工作树干净
+- 剩余边界:compose/k8s 未实跑(等 Docker/集群)、AskBI 实接(等跨项目授权)、预算百分比预警、PG 分区

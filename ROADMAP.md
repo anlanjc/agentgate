@@ -1,5 +1,8 @@
 # ROADMAP · agentgate（2026-11-03 规划，基于 ds-update hardening 轮之后）
 
+> **状态更新（2026-11-04，AG-2）**：P0/P1/P2/P3(可做部分)/P4 **全部完成**，执行明细见 EVIDENCE §⑧/§⑨；
+> 未做项只剩依赖主人的部分（compose/k8s 实跑、GitHub push、DashScope 配额、AskBI 跨项目授权）与按需项（精确滑动日志、PG 分区、SSO、预算百分比预警）。
+
 > 规划人：ZCode（AG-2 会话）。本文档只规划、不执行；执行时按黑板纪律登记根 PROGRESS.md（[AG-2] 前缀）。
 > 现状基线（2026-11-03 现场复核）：ds-update 轮 27 文件未提交（+967/-337）；**SQLite 62 passed + ruff 全绿（实跑复核）**；
 > PG 口径未复跑；文档数字漂移（README 47 / PROJECT_BOOK 41 / PITCH 55 / EVIDENCE 57，实际 62）。
