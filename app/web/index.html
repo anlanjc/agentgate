@@ -57,8 +57,14 @@
 
     <div class="card">
       <h2>用量对账</h2>
-      <div class="row"><select id="uTenant" style="flex:1" onchange="loadUsage()"></select><button class="ghost" onclick="loadUsage()">刷新</button></div>
+      <div class="row"><select id="uTenant" style="flex:1" onchange="loadUsage()"></select><button class="ghost" onclick="loadUsage()">刷新</button><button class="ghost" onclick="exportBilling()">导出 CSV</button></div>
       <table id="usage"><thead><tr><th>请求数</th><th>总 token</th><th>分模型</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card">
+      <h2>审计流水(只追加,最近 20 条)</h2>
+      <div class="row"><button class="ghost" onclick="loadAudit()">刷新</button></div>
+      <table id="audit"><thead><tr><th>动作</th><th>对象</th><th>详情</th><th>时间</th></tr></thead><tbody></tbody></table>
     </div>
   </div>
   <div id="toast"></div>
@@ -144,11 +150,34 @@ async function purgeCache(){
   const {purged} = await api('/cache', {method:'DELETE'});
   toast('已清空 '+purged+' 条缓存');
 }
+async function loadAudit(){
+  const {entries} = await api('/audit?limit=20');
+  $('#audit tbody').innerHTML = entries.map(e => `<tr>
+    <td><b>${esc(e.action)}</b></td><td class="muted">${esc(e.target_type)}:${esc(e.target_id.slice(0,12))}</td>
+    <td class="muted">${esc(JSON.stringify(e.detail ?? {})).slice(0,60)}</td>
+    <td class="muted">${esc(e.created_at.slice(0,19).replace('T',' '))}</td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">暂无</td></tr>';
+}
+async function exportBilling(){
+  const tid = $('#uTenant').value; if (!tid) { toast('先选入租户'); return; }
+  try {
+    const r = await fetch(`/admin/tenants/${tid}/billing?format=csv`, {headers: {'X-Admin-Token': adminToken()}});
+    if (!r.ok) throw new Error(r.status);
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `billing-${tid}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('账单已导出');
+  } catch (e) { toast('导出失败: ' + e.message); }
+}
 (async () => {
   $('#ver').textContent = 'v' + (await (await fetch('/health')).json()).version;
   await loadChannels(); await loadTenants();
   if ($('#kTenant').value) await loadKeyList();
   if ($('#uTenant').value) await loadUsage();
+  await loadAudit();
   setInterval(loadChannels, 5000);  // 渠道健康 5s 自刷新
 })();
 </script>
