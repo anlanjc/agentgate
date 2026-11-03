@@ -188,3 +188,12 @@
 - ruff 全绿;Alembic 迁移链 3215fe6889f5→7c1f4a9b2d10→a3d94f1c7b21→c8e51b09d447→e6f22c81a903→f9a37c2d5b84 真 PG 验证
 - git:main 分支 22 笔提交(自 747f471 起),工作树干净
 - 剩余边界:compose/k8s 未实跑(等 Docker/集群)、AskBI 实接(等跨项目授权)、预算百分比预警、PG 分区
+
+## ⑩ 收尾自查批次(2026-11-04,AG-2)——"还有没有改进"的答案
+
+- **文档漂移自查抓到本批自己造成的漂移**:RESUME(47+47/3.7ms/4.04x/10ms 四项全过期)/PITCH/PROJECT_BOOK(67)——上一批改了数字没回头同步全部文档,已全部归一到 95+97/3.55ms/4.95x。教训:**每轮改数字,同步面必须用 grep 扫全文档而不是凭记忆列清单**。
+- **ADR-006**(安全 hardening:密钥加密/审计/幂等,含"为什么不是 KMS/日志文件/request_id")+ **ADR-007**(语义缓存双后端,含"为什么不整体迁 pgvector/为什么不是 RediSearch")——设计纪律回到"每个决策有 ADR"。
+- **webhook HMAC 签名**(迁移 b4c19d2e6f78):`X-Agentgate-Signature: sha256=HMAC(secret, "{ts}.{body}")`+时间戳防重放;租户 webhook_secret 列+轮换端点(审计留痕);无 secret 不签名(向后兼容)。测试:真 HTTP 接收端验签+篡改不通过。
+- **requirements.lock**(pip freeze 78 行)+ CI 双 job 改锁文件安装——依赖可复现。
+- **管理台补审计流水卡片+账单 CSV 导出按钮**;截图重拍(11-02 旧 UI 过期):管理台(token 输入/双渠道健康/key 签发/对账/**审计流水**/**导出 CSV**)+ Playground(流式实测 TTFT 16ms/总延迟 33ms/BYPASS/usage 11/7/18)。本地 mock 栈零花费;IAB 截图管线 fullPage/clip 有 stride 重影 bug→定长视口直拍+冻结定时器规避。
+- 终态:97 passed + 2 skipped(SQLite 全量)/ ruff 全绿;git main 26 笔提交,工作树干净。
