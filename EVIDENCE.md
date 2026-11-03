@@ -18,7 +18,7 @@
 
 | 验收项 | 目标 | 实测 | 口径 |
 |---|---|---|---|
-| 每请求附加开销 | < 10ms | **3.70ms** ✅ | c=1 无排队;过网关 P50 4.09ms − 直连 P50 0.39ms;`scripts/load_test.py`(evidence/load_report.md) |
+| 每请求附加开销 | < 10ms | **3.55ms** ✅(P1 重测现行口径) | c=1 无排队差值法;hardening 后 2000 req 复测;`scripts/load_test.py`(evidence/load_report.md) |
 | 并发扣减零超卖 | 桶硬上界 | **100 并发恰放行 50**(容量 50)✅ | 真 Redis Lua,`test_bucket_concurrent_zero_oversell` |
 | 记账原子性 | 零丢失 | **100 并发恰 1800 token、账本 100 行** ✅ | `test_concurrent_accounting_atomic` |
 | 故障注入:全渠道 500 | 透传+降级 | 透传最后错误,渠道头=exhausted;Redis 关停路由降级不崩 ✅ | `test_all_channels_fail_passthrough` / `test_redis_down_router_degrades` |
@@ -31,7 +31,7 @@
 - **教训 1(压测第一课)**:首版数字 142 req/s、P50 335ms —— 瓶颈是 **httpx 纯 Python 客户端自身**
   (c=1 时网关实为 P50 3.3ms)。换 aiohttp(C 解析器)+ 差值法后数字才可信。
 - **教训 2(口径)**:c=50 的中位差 120ms 是**排队延迟**(单进程 CPU 串行 ~3ms/req × 50 并发),
-  不是每请求代价 —— 附加开销必须在 c=1 无排队下测。修正后 **3.70ms 达标**。
+  不是每请求代价 —— 附加开销必须在 c=1 无排队下测。修正后 **3.70ms 达标**(P1 重测后现行口径 **3.55ms**,见 §⑨)。
 - **组件分解**(c=50 服务时间):裸 mock 0.34ms → +httpx 转发跳 0.7ms → +鉴权/准入/路由/记账 ≈ 2.8ms。
 - **已做优化**(测试全绿保护下):朴素 EVAL → EVALSHA;准入 3 次往返 → 单 Lua 1 次;鉴权缓存命中零
   DB 会话;记账 INCRBY+窗口 → pipeline;路由 EMA 读改写 → 原子 Lua。**每请求 Redis 往返 8→5**。
@@ -143,7 +143,7 @@
 - **文档口径统一(本批完成)**:README/PROJECT_BOOK/PITCH 全部对齐 62×2 与现行设计(TPM 双窗口/Streams 记账/outbox/租户域幂等);Grafana 面板同步(USAGE_DROPPED→TASKS_DEAD,队列积压语义更新)。
 - **Redis 故障语义(P0-C,定义+测试)**:准入 fail-closed(RedisError→503 admission_unavailable+Retry-After,计费硬上界宁可拒不可漏)/ 鉴权降级直查 DB(事实来源,缓存读/回填失败不阻塞)/ 响应与语义缓存降级当 miss(优化非正确性)。三条故障面独立,各有测试(test_redis_down_admission_fails_closed / test_redis_down_auth_degrades_to_db / test_cache_redis_error_degrades_to_miss)。
 - **outbox 双向注入(P0-C)**:XADD 抛异常→published_at 为空→sweeper 补投→消费一次(test_outbox_sweeper_republishes_after_xadd_failure);水位丢失(已投递未消费窗口)→重复投递→状态机幂等吞掉、两条消息都 ACK+DEL(test_marker_loss_republishes_but_consumes_once)。
-- **诚实边界(剩余)**:压测 3.70ms/4.04x 为 hardening 前口径,P1 重测后更新;水位丢失场景若发生在"已消费后"(status=done),sweeper 不补投 —— 这是正确设计(账本已落),补投只服务 pending 窗口。
+- **诚实边界(剩余)**:水位丢失场景若发生在"已消费后"(status=done),sweeper 不补投 —— 这是正确设计(账本已落),补投只服务 pending 窗口。(压测旧口径已在 P1 重测销账,见 §⑨)
 
 ## ⑨ P1-P4 自主推进批次(2026-11-03/04,AG-2)——压测重测+安全三连+部署生态,16 笔提交
 

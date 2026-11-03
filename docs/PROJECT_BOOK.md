@@ -8,8 +8,8 @@
 "我做了一个多租户 LLM/Agent 网关,对标 LiteLLM 的核心链路自研:OpenAI 兼容代理、
 virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理、故障转移和 Streams
 异步任务。它是 IO 密集型系统——瓶颈在上游模型的秒级延迟,所以我用 Python/FastAPI,
-压测的每请求附加开销是 3.7 毫秒;多进程水平扩展 1→4 worker 是 4.04 倍近线性,因为共享
-状态全部在 Redis。67 项测试双数据库口径全绿,真实 PolicyCompass 已经接在它后面跑。"
+压测的每请求附加开销是 3.55 毫秒;多进程水平扩展 1→4 worker 是 4.95 倍近线性,因为共享
+状态全部在 Redis。95+97 项测试双数据库口径全绿,真实 PolicyCompass 已经接在它后面跑。"
 
 ## 1. 高频问题 → 深挖点 → 证据
 
@@ -50,7 +50,7 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 
 ### Q8 多副本/水平扩展?
 - 一句话:所有跨副本状态(限流桶/渠道健康/鉴权缓存/预算)都在 Redis,进程无状态,uvicorn --workers N 或 k8s 任意扩。
-- 深挖:压测 1/2/4 worker = 1.00x/2.15x/4.04x 近线性(共享 SQLite 账本在 PG 下无写锁顾虑);Redis 7 AOF 保证任务流重启不丢。
+- 深挖:压测 1/2/4 worker = 1.00x/2.09x/4.95x 近线性(账本经 Streams 消费者串行化,PG 下无写锁顾虑);Redis 7 AOF 保证任务流重启不丢。
 - 证据:evidence/load_workers.md;deploy/docker-compose.yml(appendonly yes)。
 
 ### Q9 监控怎么做?线上慢怎么查?
@@ -61,12 +61,32 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 ### Q10 这个项目最难的点?
 - 推荐答:不是某个算法,是**把语义做对**——流式下 fallback 不可回滚怎么办、预算在途突发怎么诚实表述、at-least-once 怎么推导出幂等消费、多副本限流放大坑。每一条都有测试和真实故障演练背书。
 
+### Q11 安全做了什么?(密钥/审计/重试)
+- 一句话:三层——渠道密钥 Fernet 静态加密(prod 强制主密钥,启动校验器拒绝裸奔);管理面审计日志(五个动作与业务变更同事务,raw key 与渠道密钥零入审计面);客户端 Idempotency-Key(重试回放,不重执行不重计费)。
+- 深挖:①为什么加密失败宁可路由失败——解密失败抛 InvalidToken 让该渠道冷却,不静默用错密钥打上游(错误密钥=把租户流量发给未知方);②审计与变更同事务的意义——不出现"改了但没记",回滚连审计一起滚;③幂等键作用域=租户+key+客户端 key,回放行 token=0(可审计不重扣);④诚实边界:幂等仅非流式(SSE 不可重放),静态加密防"拖库可用",防不了内存读取(那需要 KMS/信封加密,backlog)。
+- 证据:test_security.py 7 项(含端到端重启恢复)/test_admin_audit.py 4 项/test_idempotency.py 4 项。
+
+### Q12 预算体系怎么设计的?(key 级+租户级)
+- 一句话:key 预算 + 租户预算两级,同一次 Lua INCRBY 原子记账——不存在"租户扣了 key 没扣"的中间态;租户预算堵"多签几把 key 绕单 key 预算"。
+- 深挖:①为什么租户预算读数有 60s 窗口——租户预算随 auth 缓存带出(miss 时 join),预算是计量控制非安全边界,窗口可接受;设置预算时计数器即时从账本校准(rebuild),新 key 立即生效;②每 key 并发上限是第三道闸(RPM/TPM 之外),崩溃泄漏靠 TTL 300s 有界;③计量制诚实表述:预检读数与后台记账有天然竞态,突发最多超出"在途数×单请求 token",硬上界永远是限流桶。
+- 证据:test_tenant_budget.py 3 项(跨 key 拦截/校准语义/60s 窗口演示)/test_p2_small.py。
+
+### Q13 语义缓存为什么有两个后端?pgvector 版怎么做的?
+- 一句话:默认 Redis ZSET+暴力余弦(O(N),≤200 条,SQLite/便携 Redis 口径成立);生产规模换 pgvector KNN+HNSW(`semantic_backend=pgvector`,PG 口径实测),同一门控与租户隔离语义。
+- 深挖:①维度显式配置不从首条数据猜——错维度的 HNSW 索引比没有更糟;②表由 ensure_table 幂等管理而非 alembic——vector 维度运行时才知,且 SQLite 方言没有该类型(双口径纪律:PG 专属测试在 SQLite 口径诚实 skip);③降级语义同缓存层:PG 故障当 miss 不阻塞请求;④缓存键绑 context_digest(system/历史/采样参数),同问题不同上下文不串答案。
+- 证据:test_m5_semantic_pg.py 2 项(PG 真库 KNN 往返+跨租户不召回);内嵌 PG 16.2 自带 vector 0.6.2。
+
+### Q14 可观测性怎么落地的?trace 怎么跨服务?
+- 一句话:指标(TTFT/token/分租户分渠道/队列积压/死信/渠道冷却)+ OTel 手动 span(每次上游尝试,属性 channel/model/status)+ W3C traceparent 完整传播(提取/注入/回传);compose 里 Jaeger 一键看 trace,6 条 SLO 告警规则。
+- 深挖:①traceparent 非法不猜(版本 ff/长度不对按无头处理,新建 trace);②门控用 app 级 state.tracer 而非模块全局——FastAPI 0.162 内置原生 telemetry,全局 provider 存在时自动叠 span,全局门控会跨 app 污染(实测踩到);③降级三分原则:计费硬上界 fail-closed、只读快路径降级 DB、缓存类降级当 miss——每条故障面语义独立且有测试。
+- 证据:test_m6_tracing.py 6 项;deploy/alerts.yml;compose jaeger 服务。
+
 ## 2. 诚实边界(主动说,反而是加分)
 
-1. 响应缓存是精确匹配;语义缓存为可插拔 embedder(测试 HashEmbedder=词面 bigram 仅开发口径,生产 DashScope embedding;pgvector/RediSearch KNN 在 backlog)。
+1. 响应缓存是精确匹配;语义缓存为可插拔 embedder+双后端(测试 HashEmbedder=词面 bigram 仅开发口径,生产 DashScope embedding;默认 Redis 暴力余弦 ≤200 条,`semantic_backend=pgvector` 换 KNN/HNSW 已实现)。
 2. TPM 已升级双窗口加权滑动近似(消除固定窗口突刺);精确滑动日志在 backlog。
 3. 预算是计量制不是预扣制;严格预扣需要估算 token,误差同样存在——取舍写在 ADR-002。
-4. SQLite 是测试方言,生产 PG;双口径 67+67 全绿(pgserver 内嵌 PG 16.2 复跑),PG 分区等特性在 backlog。
+4. SQLite 是测试方言,生产 PG;双口径 95+97 全绿(pgserver 内嵌 PG 16.2 复跑),PG 分区等特性在 backlog。
 5. PC 接入的 shim 不上报 usage(PC 无 token 计量),账本 token=0 是诚实记录不是缺陷。
 6. 管理台无鉴权 UI 层(admin_token 保护 API,页面本身内网用);生产加 SSO 在 backlog。
 

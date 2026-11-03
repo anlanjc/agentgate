@@ -37,6 +37,8 @@ class Tenant(Base):
     webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)  # 任务完成回调
     # 租户级月度/总量 token 预算(NULL=不限):key 级预算的兜底,堵"多签几把 key 绕预算"
     budget_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # webhook HMAC 签名密钥(NULL=不签名):接收端用同一密钥验 X-Agentgate-Signature
+    webhook_secret: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

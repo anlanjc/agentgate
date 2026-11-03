@@ -27,17 +27,36 @@ def make_task_handler(session_factory):
 
 
 async def deliver_webhook(payload: dict) -> dict:
+    """投递回调;租户配了 webhook_secret 时附 HMAC 签名(P4 安全补强)。
+
+    验签协议(接收端):
+        X-Agentgate-Timestamp: unix 秒
+        X-Agentgate-Signature: sha256=<HMAC(secret, "{timestamp}.{raw_body}")>
+    时间戳参与签名防重放;接收端应自行拒绝过旧时间戳(建议 5 分钟窗)。
+    """
+    import hashlib
+    import hmac as hmac_mod
+    import json as json_mod
+    import time as time_mod
+
     url = payload["webhook_url"]
+    secret = payload.get("webhook_secret")
+    body = json_mod.dumps(
+        {
+            "request_id": payload.get("request_id"),
+            "model": payload.get("model"),
+            "total_tokens": payload.get("total_tokens"),
+        },
+        ensure_ascii=False,
+    ).encode()
+    headers = {"Idempotency-Key": payload.get("request_id", ""), "Content-Type": "application/json"}
+    if secret:
+        ts = str(int(time_mod.time()))
+        mac = hmac_mod.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256)
+        headers["X-Agentgate-Timestamp"] = ts
+        headers["X-Agentgate-Signature"] = "sha256=" + mac.hexdigest()
     async with httpx.AsyncClient(trust_env=False, timeout=5.0) as client:  # 该机代理坑:直连
-        resp = await client.post(
-            url,
-            json={
-                "request_id": payload.get("request_id"),
-                "model": payload.get("model"),
-                "total_tokens": payload.get("total_tokens"),
-            },
-            headers={"Idempotency-Key": payload.get("request_id", "")},
-        )
+        resp = await client.post(url, content=body, headers=headers)
     if resp.status_code >= 500 or resp.status_code == 429:
         resp.raise_for_status()  # 可重试错误:抛出走队列重试/死信路径
     return {"delivered": True, "status": resp.status_code}

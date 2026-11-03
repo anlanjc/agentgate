@@ -430,6 +430,7 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
                         "webhook_callback",
                         {
                             "webhook_url": tenant.webhook_url,
+                            "webhook_secret": tenant.webhook_secret,
                             "request_id": record["request_id"],
                             "model": record["model"],
                             "total_tokens": record["total_tokens"],

@@ -3,10 +3,10 @@
 ## 简历项目区(一行式,选一)
 
 **主推版(信息密度优先):**
-> **agentgate · 多租户 LLM/Agent 网关**(Python/FastAPI):自研 LiteLLM 核心链路——OpenAI 兼容代理与 SSE 流式;virtual key 缓存优先鉴权;Redis+Lua 分布式限流(并发 100 恰放行 50,零超卖);请求路径零 DB 写,Streams 任务队列 at-least-once+幂等(崩溃 XCLAIM 恢复/死信);故障转移状态机(429 冷却+Retry-After+EMA 路由),kill -9 演练 10ms 切换;精确响应缓存(租户隔离);Prometheus 可观测(TTFT);每请求附加开销 3.7ms,多进程 1→4 worker 4.04x 近线性;SQLite/PostgreSQL 双口径 47+47 测试全绿;真实 PolicyCompass 已接入,自家网关管自家 Agent。
+> **agentgate · 多租户 LLM/Agent 网关**(Python/FastAPI):自研 LiteLLM 核心链路——OpenAI 兼容代理与 SSE 流式;virtual key 缓存优先鉴权;Redis+Lua 分布式限流(并发 100 恰放行 50,零超卖);请求路径零 DB 写,Streams 任务队列 at-least-once+幂等(崩溃 XCLAIM 恢复/死信);故障转移状态机(429 冷却+Retry-After+EMA 路由),kill -9 演练实测自动切换(客户端零感知);精确响应缓存(租户隔离+单飞锁)+语义缓存双后端(Redis 余弦|pgvector HNSW);渠道密钥 Fernet 加密+admin 审计日志;客户端 Idempotency-Key 重试不重计费;key/租户双级预算+每 key 并发上限;Prometheus 可观测(TTFT);每请求附加开销 3.55ms(c=1 差值口径),多进程 1→4 worker 4.95x 近线性;SQLite/PostgreSQL 双口径 95+97 项测试全绿(含 pgvector 语义缓存 KNN/审计/账单/客户端幂等键);真实 PolicyCompass 已接入,自家网关管自家 Agent。
 
 **精简版(版面紧张时):**
-> **agentgate · 多租户 LLM 网关**(Python):OpenAI 兼容代理+SSE;Redis+Lua 限流零超卖;零 DB 写记账;Streams at-least-once+幂等;故障转移 kill -9 演练 10ms 切换;附加开销 3.7ms;双数据库口径 94 测试全绿;真实 Agent 应用已接入。
+> **agentgate · 多租户 LLM 网关**(Python):OpenAI 兼容代理+SSE;Redis+Lua 限流零超卖;零 DB 写记账;Streams at-least-once+幂等;故障转移 kill -9 演练实测自动切换(客户端零感知);附加开销 3.7ms;双数据库口径 94 测试全绿;真实 Agent 应用已接入。
 
 ## 面试三句话(标准回答)
 

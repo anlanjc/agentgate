@@ -41,6 +41,7 @@ def _parse_dt(value: str | None, field: str) -> datetime | None:
 class TenantCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     webhook_url: str | None = None
+    webhook_secret: str | None = Field(default=None, max_length=128)
 
 
 class KeyCreate(BaseModel):
@@ -68,7 +69,10 @@ def _audit(db, action: str, target_type: str, target_id: str, detail: dict | Non
 async def create_tenant(body: TenantCreate, request: Request) -> dict:
     _require_admin(request)
     async with request.app.state.session_factory() as db:
-        tenant = Tenant(id=uuid.uuid4().hex[:32], name=body.name, webhook_url=body.webhook_url)
+        tenant = Tenant(
+            id=uuid.uuid4().hex[:32], name=body.name, webhook_url=body.webhook_url,
+            webhook_secret=body.webhook_secret,
+        )
         db.add(tenant)
         _audit(db, "tenant.create", "tenant", tenant.id, {"name": body.name})
         try:
@@ -78,7 +82,29 @@ async def create_tenant(body: TenantCreate, request: Request) -> dict:
             raise GatewayError(
                 409, "tenant name already exists", "invalid_request_error", "tenant_exists"
             )
-        return {"id": tenant.id, "name": tenant.name, "webhook_url": tenant.webhook_url}
+        return {
+            "id": tenant.id, "name": tenant.name, "webhook_url": tenant.webhook_url,
+            "webhook_signed": bool(tenant.webhook_secret),
+        }
+
+
+class WebhookSecretRotate(BaseModel):
+    webhook_secret: str = Field(min_length=16, max_length=128)
+
+
+@router.post("/tenants/{tenant_id}/webhook-secret")
+async def rotate_webhook_secret(tenant_id: str, body: WebhookSecretRotate, request: Request) -> dict:
+    """轮换 webhook 签名密钥;接收端需同步更新验签密钥(双密钥并行窗口不做,诚实边界)。"""
+    _require_admin(request)
+    async with request.app.state.session_factory() as db:
+        row = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant = row.scalar_one_or_none()
+        if tenant is None:
+            raise GatewayError(404, "tenant not found", "invalid_request_error", "tenant_not_found")
+        tenant.webhook_secret = body.webhook_secret
+        _audit(db, "tenant.webhook_secret_rotate", "tenant", tenant_id, {})
+        await db.commit()
+    return {"tenant_id": tenant_id, "webhook_signed": True}
 
 
 class TenantBudgetUpdate(BaseModel):

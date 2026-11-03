@@ -104,7 +104,7 @@ app/
   mcp_server.py   MCP stdio 工具面(渠道健康/用量/预算/签发 key,与网关共享状态)
   web/        管理台单文件页(/admin/web)
   db/         SQLAlchemy 2.0 方言中立模型 + Alembic
-docs/adr/     ADR-001~005(选型五篇) · docs/PITCH.md 开场五连应答脚本 · docs/handwrite_cards.md 手撕卡三张
+docs/adr/     ADR-001~007(选型五篇+安全 hardening+语义缓存双后端) · docs/PITCH.md 开场五连应答脚本 · docs/handwrite_cards.md 手撕卡三张
 docs/PROJECT_BOOK.md  面试深挖手册(10 问三段式 + 诚实边界 + 演示剧本)
 tests/        95 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/账本幂等/审计/双数据库)
 scripts/      load_test(附加开销口径)· load_workers(扩展曲线)· demo_admin · demo_ecosystem · demo_pc_gateway · smoke_real · verify_pg_migration · agent_shim_example

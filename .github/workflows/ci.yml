@@ -24,8 +24,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install deps (locked)
+        run: pip install -r requirements.lock
       - name: Lint
         run: ruff check app tests scripts
       - name: Test(SQLite 方言)
@@ -62,8 +62,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install deps (locked)
+        run: pip install -r requirements.lock
       - name: Alembic migration on real PostgreSQL
         env:
           AGENTGATE_DB_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
