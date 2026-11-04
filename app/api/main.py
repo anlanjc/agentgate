@@ -225,7 +225,8 @@ def create_app(
         from starlette.responses import FileResponse
 
         page = Path(__file__).resolve().parents[2] / "app" / "web" / "style.css"
-        return FileResponse(page, media_type="text/css")
+        # no-cache:样式随代码演进,浏览器启发式缓存会把旧主题钉在页面上(实测踩到)
+        return FileResponse(page, media_type="text/css", headers={"Cache-Control": "no-cache"})
 
     return app_
 
