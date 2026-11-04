@@ -82,6 +82,18 @@ async def test_concurrent_accounting_atomic(auth_gateway):
     assert all(r.status_code == 200 for r in responses)
     window = await quota_service.tpm_window_get(app.state.redis, "k-test")
     assert window == 1800, f"原子性破约:window={window}"
+    # 账本轮询等齐 100 行:记账 enqueue 发生在各请求的 BackgroundTask 里,
+    # 全量负载下单次 flush 可能抢跑(部分任务尚未入队,实测 93/100)——smoke_real 同款修复
+    from sqlalchemy import func, select
+
+    from app.db.models import UsageRecord
+
+    for _ in range(100):
+        async with app.state.session_factory() as db:
+            n = (await db.execute(select(func.count(UsageRecord.id)))).scalar_one()
+        if n >= 100:
+            break
+        await asyncio.sleep(0.05)
     await app.state.task_queue.flush()
     usage = (await client.get(f"/admin/tenants/{TENANT_ID}/usage")).json()
     assert usage["requests"] == 100
