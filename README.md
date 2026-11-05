@@ -4,6 +4,23 @@
 > 定位:简历第三层 —— 检索(PolicyCompass)→ 多 Agent(AskBI)→ **平台化(agentgate)**。
 > 设计有据:2026-11 三路实证调研(开源架构 / 30 条 JD 词频 / 面经追问链),每个核心设计标注师承。
 
+[![CI](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml/badge.svg)](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml) [![tests](https://img.shields.io/badge/tests-SQLite%2095%2B2skip%20%2F%20PG%2097-brightgreen)]() [![overhead](https://img.shields.io/badge/c%3D1%20附加开销-3.55ms-blue)]() [![workers](https://img.shields.io/badge/多worker扩展-4.95x-blue)]() [![方言](https://img.shields.io/badge/DB-SQLite%2FPG%20双口径-blue)]()
+
+## 架构总览
+
+```mermaid
+flowchart LR
+    C[客户端<br/>virtual key] --> AUTH{{鉴权<br/>key_hash 缓存优先}}
+    AUTH --> ADM{{准入单 Lua<br/>令牌桶+TPM+预算<br/>EVALSHA}}
+    ADM --> R{{路由<br/>EMA 延迟优先·冷却状态机}}
+    R -->|SSE 流式| UP[上游渠道<br/>字节透传]
+    R -->|全渠道冷却| S503[fail-closed 503]
+    R --> OB[(Streams outbox<br/>水位补投)]
+    OB --> Q[异步任务队列<br/>XACK/XCLAIM·死信]
+    Q --> BK[(记账<br/>后台单写者<br/>request_path 零 DB 写)]
+    BK --> OBS[OTel/Prom<br/>SLO 告警]
+```
+
 ## 六个可以对着讲两分钟的硬点
 
 | # | 设计 | 师承(面试可引) | 测试 |
