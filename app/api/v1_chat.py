@@ -743,7 +743,13 @@ async def _non_stream_core(
     if auth is not None and semantic_cache.semantic_enabled(state.settings, req):
         semantic_ctx = semantic_cache.context_digest(req.model, payload)
     if auth is not None and not exact_hit and semantic_ctx is not None and question:
-        hit = await _semantic_search(state, auth, req.model, semantic_ctx, question)
+        try:
+            hit = await _semantic_search(state, auth, req.model, semantic_ctx, question)
+        except Exception as exc:  # noqa: BLE001
+            # GW-2 修复(评审 2.0):embed/后端故障曾穿透主链路致 500+漏记账——语义缓存
+            # 是优化路径,故障必须降级为 miss 继续正常转发,而非杀死请求。
+            hit = None
+            logger.warning("semantic_cache_search_degraded", error=str(exc))
         if hit is not None:
             if sf_acquired:
                 await response_cache.release(state.redis, rkey)
@@ -810,7 +816,12 @@ async def _non_stream_core(
             and question
             and body_json is not None
         ):
-            await _semantic_store(state, auth, req.model, semantic_ctx, question, body_json)
+            try:
+                await _semantic_store(state, auth, req.model, semantic_ctx, question, body_json)
+            except Exception as exc:  # noqa: BLE001
+                # GW-2 修复(评审 2.0):入库失败不影响已拿到的上游响应——
+                # 此刻响应体已算完,只丢一次缓存写入,降级记录即可。
+                logger.warning("semantic_cache_store_degraded", error=str(exc))
     record = _record(
         auth, req.model, request_id, resp.status_code, usage, None, latency_ms,
         channel=channel or "",

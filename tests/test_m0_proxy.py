@@ -196,3 +196,42 @@ async def test_models_list(gateway):
     resp = await client.get("/v1/models")
     assert resp.status_code == 200
     assert resp.json()["data"][0]["id"] == "mock-model"
+
+
+# ---- GW-1 回归（评审 2.0 high）：客户端 X-Request-Id 曾无校验，超长致 PG 账本行静默丢失 ----
+
+async def test_client_request_id_too_long_replaced(gateway):
+    """超长 ID（>128）必须被弃用并换服务端生成 ID 回写响应头。"""
+    client, app, _ = gateway
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=_chat_body(),
+        headers={"X-Request-Id": "x" * 500},
+    )
+    rid = resp.headers["x-request-id"]
+    assert rid != "x" * 500
+    assert len(rid) == 32  # 服务端 uuid4().hex
+
+
+async def test_client_request_id_control_chars_replaced(gateway):
+    """控制字符/空白 ID 同样拒绝（可见 ASCII 白名单外一律换生成 ID）。"""
+    client, app, _ = gateway
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=_chat_body(),
+        headers={"X-Request-Id": "bad\nid\rwith\ttabs"},
+    )
+    rid = resp.headers["x-request-id"]
+    assert "\n" not in rid and "\r" not in rid and "\t" not in rid
+    assert len(rid) == 32
+
+
+async def test_client_request_id_normal_passthrough(gateway):
+    """合法 ID（可见 ASCII ≤128）原样继承——回归锁防校验过严。"""
+    client, app, _ = gateway
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=_chat_body(),
+        headers={"X-Request-Id": "req-abc-123"},
+    )
+    assert resp.headers["x-request-id"] == "req-abc-123"

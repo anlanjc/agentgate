@@ -154,3 +154,64 @@ async def test_hash_embedder_deterministic():
     v1 = await e.embed("公积金贷款")
     v2 = await e.embed("公积金贷款")
     assert v1 == v2 and abs(sum(abs(x) for x in v1)) > 0
+
+
+# ---- GW-2 回归（评审 2.0 high）：embed/后端故障必须降级为 miss，不得 500+漏记账 ----
+
+async def test_semantic_search_embed_failure_degrades_to_upstream(sem_gateway, monkeypatch):
+    """embed 抛错 → 请求仍 200 回源，且账本正常落行（曾穿透主链路致 500 漏记账）。"""
+    from sqlalchemy import select
+
+    from app.db.models import UsageRecord
+
+    client, app, raw, _ = sem_gateway
+    h = auth_headers(raw)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("embed upstream down")
+
+    monkeypatch.setattr(app.state.embedder, "embed", _boom)
+
+    r = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert r.status_code == 200
+    assert "choices" in r.json()  # 正常回源答案，不是网关错误信封
+
+    # 记账走 BackgroundTask，响应返回后台任务才落库——轮询等齐再断言（AG-2 同款教训）
+    import asyncio
+
+    rows = []
+    async with app.state.session_factory() as db:
+        for _ in range(20):
+            rows = (
+                await db.execute(select(UsageRecord).where(UsageRecord.tenant_id == "t-s1"))
+            ).scalars().all()
+            if rows:
+                break
+            await asyncio.sleep(0.1)
+    assert len(rows) == 1  # 漏记账回归锁：请求完成后账本恰有 1 行
+
+
+async def test_semantic_store_embed_failure_does_not_break_response(sem_gateway, monkeypatch):
+    """响应已到手后入库失败 → 响应原样返回 200（只丢缓存写入）。"""
+    client, app, raw, _ = sem_gateway
+    h = auth_headers(raw)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("embed upstream down")
+
+    # search 放行（能走到 store 说明先 miss），只炸 store 里的 embed
+    real_embed = app.state.embedder.embed
+    state_box = {"phase": 0}
+
+    async def _boom_second(*args, **kwargs):
+        state_box["phase"] += 1
+        if state_box["phase"] >= 2:
+            raise RuntimeError("embed upstream down")
+        return await real_embed(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.embedder, "embed", _boom_second)
+
+    r = await client.post("/v1/chat/completions", json=_body(), headers=h)
+    assert r.status_code == 200
+    assert "choices" in r.json()
+    assert "x-cache" not in r.headers  # 入库失败即无缓存命中可言

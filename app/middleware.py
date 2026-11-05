@@ -6,6 +6,7 @@ P50 21ms→13ms(https://docs.litellm.ai/blog/fastapi-middleware-performance)。
 网关是逐字节转发路径,中间件必须零缓冲。
 """
 
+import re
 import time
 import uuid
 
@@ -15,6 +16,15 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.log import bind_request_id, current_request_id, get_logger
 
 logger = get_logger("http")
+
+# GW-1 修复(评审 2.0):客户端 X-Request-Id 曾无校验直入账本——超长/控制字符 ID
+# 使 PG 账本行写入失败被静默吞掉。校验=可见 ASCII ≤128(对齐 W3C traceparent parent-id
+# 与常见反向代理约束),非法即弃用换服务端生成 ID(响应头回真实 ID,客户端不受影响)。
+_REQUEST_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
+
+
+def _valid_request_id(value: str) -> bool:
+    return bool(_REQUEST_ID_RE.fullmatch(value))
 
 
 class RequestContextMiddleware:
@@ -33,7 +43,7 @@ class RequestContextMiddleware:
             if key == b"x-request-id":
                 req_id = value.decode("latin-1", errors="replace")
                 break
-        if not req_id:
+        if not _valid_request_id(req_id):
             req_id = uuid.uuid4().hex
         bind_request_id(req_id)
 
