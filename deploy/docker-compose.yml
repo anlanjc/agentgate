@@ -16,6 +16,11 @@ services:
       AGENTGATE_UPSTREAM_API_KEY: ${AGENTGATE_UPSTREAM_API_KEY:-}
       # 不提供默认值:未设置时 compose 直接报错,杜绝 change-me 上公网。
       AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:?set a strong AGENTGATE_ADMIN_TOKEN first}
+      # GW-7(评审 2.0):渠道密钥静态加密主密钥(Fernet)—— compose 生产拓扑曾漏掉
+      # 这个注入位,gateway 因 prod 校验器拒绝启动而 crash-loop,运维最省事的"修复"
+      # 是删 ENVIRONMENT=prod,三道安全闸随之全灭。这里强制要求,生成:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      AGENTGATE_CHANNEL_ENC_KEY: ${AGENTGATE_CHANNEL_ENC_KEY:?generate a Fernet key first, see README deploy section}
       AGENTGATE_LLM_TRUST_ENV: "false"
       # 分布式追踪(M6,默认关;compose 拓扑里接到 Jaeger,P3-17)
       AGENTGATE_OTEL_ENABLED: "true"

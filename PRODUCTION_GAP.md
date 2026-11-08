@@ -7,7 +7,7 @@
 | # | 项 | 现状 | 触发条件 | 工作量 |
 |---|---|---|---|---|
 | A1 | Docker 就绪跑 compose | compose 交付,本机无 Docker(ADR-002) | 装 Docker Desktop | 0.5h(compose up + 冒烟) |
-| A2 | admin_token 强制 | 默认空=本机开发不设防 | 公网部署前 | 已实现,配 env 即可 |
+| A2 | admin_token 强制 | 默认空=本机开发不设防 | 公网部署前 | 已实现,配 env 即可(还需 AGENTGATE_CHANNEL_ENC_KEY 主密钥,compose `:?` 强制) |
 | A3 | HTTPS/反代 | uvicorn 裸 HTTP | 公网 | 1h(nginx/Caddy + 证书) |
 | A4 | 日志落盘与轮换 | structlog 到 stderr | 常驻 | 1h(logrotate/loki) |
 | A5 | Redis 持久化确认 | compose 已 appendonly yes;本机便携实例 --save "" | 生产 | 0(已配置) |
@@ -39,5 +39,9 @@
 
 ## 结论
 
-代码层无必做阻塞项——A1 装完 Docker、A2 配一个 env,即满足"生产可部署"。
+代码层无必做阻塞项——A1 装完 Docker、A2 配齐两个 env(`AGENTGATE_ADMIN_TOKEN`
++ `AGENTGATE_CHANNEL_ENC_KEY`,compose 均为 `:?` 强制项,缺一个 `docker compose up`
+直接报错),即满足"生产可部署"。主密钥生成:
+`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。
+⚠ compose 拓扑的容器真启动冒烟属部署日动作(本机无 Docker,静态验证口径)。
 其余按用户量触发,与 askbi/PC 的 PRODUCTION_GAP 同构。
