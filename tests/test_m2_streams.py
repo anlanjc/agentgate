@@ -318,7 +318,6 @@ async def test_terminal_write_lost_race_keeps_winner_result(queue_env):
     修复前终态回写只按 id 无条件 UPDATE —— 双副本接管场景下后写者翻转前写者的
     终态/结果。修复后带 status='processing' 守卫,rowcount=0 放弃写入,消息不 ACK,
     由 reclaim 按"已 done"幂等清理。"""
-    from datetime import UTC, datetime
 
     from sqlalchemy import select, update
 
