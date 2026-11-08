@@ -488,6 +488,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
 
     # ---- Idempotency-Key(P2):重试安全,仅非流式(流式响应体不可重放,照常执行并留痕)----
     idem_sk: str | None = None
+    idem_token: str | None = None  # GW-3:锁属主 token,release 只删自己的锁
     raw_idem = (request.headers.get("idempotency-key") or "").strip()
     if raw_idem:
         if auth is None:
@@ -625,7 +626,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 headers={"x-idempotent-replay": "true", "x-upstream-channel": "replay"},
                 background=BackgroundTask(_account, request, auth, record),
             )
-        if not await idempotency.acquire(state.redis, idem_sk):
+        acquired, idem_token = await idempotency.acquire(
+            state.redis, idem_sk,
+            ttl_ms=state.settings.idempotency_lock_ttl_seconds * 1000,
+        )
+        if not acquired:
             raise GatewayError(
                 409, "request with this Idempotency-Key is still in flight",
                 "invalid_request_error", "idempotency_key_conflict", retry_after_s=2,
@@ -633,13 +638,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     try:
         return await _non_stream_core(
             req, request, state, payload, request_id, request_t0, auth, idem_sk,
-            forward_headers, rl_headers, trace_ctx, captured,
+            idem_token, forward_headers, rl_headers, trace_ctx, captured,
         )
     finally:
         if idem_sk is not None:
             from app import idempotency
 
-            await idempotency.release(state.redis, idem_sk)
+            # GW-3:compare-and-delete —— 只删自己持有的锁;锁过期被重试方接管的
+            # 场景下这里是无害 no-op(旧代码会无条件 delete,删掉重试方的锁)。
+            await idempotency.release(state.redis, idem_sk, idem_token)
 
 
 async def _semantic_search(state, auth: AuthResult, model: str, ctx: str, question: str):
@@ -678,7 +685,8 @@ async def _semantic_store(state, auth: AuthResult, model: str, ctx: str, questio
 async def _non_stream_core(
     req: ChatCompletionRequest, request: Request, state, payload: dict,
     request_id: str, request_t0: float, auth: AuthResult | None,
-    idem_sk: str | None, forward_headers: dict, rl_headers: dict | None = None,
+    idem_sk: str | None, idem_token: str | None, forward_headers: dict,
+    rl_headers: dict | None = None,
     trace_ctx=None, captured: dict | None = None,
 ) -> Response:
     """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。"""
@@ -838,13 +846,15 @@ async def _non_stream_core(
     if rkey is not None:
         extra_headers["x-cache"] = "MISS"
     if idem_sk is not None and 200 <= resp.status_code < 300 and body_json is not None:
-        # 成功响应才进入重放库存(错误响应视为瞬态,重试重新执行);
-        # 释放锁由外层 finally 兜底,这里存完即释放,窗口最小化。
-        await idempotency.store(
-            state.redis, idem_sk, resp.status_code, body_json,
-            state.settings.idempotency_ttl_seconds,
-        )
-        await idempotency.release(state.redis, idem_sk)
+        # 成功响应才进入重放库存(错误响应视为瞬态,重试重新执行)。
+        # GW-3:先释放(compare-and-delete)再按归属条件 store —— release 返回 False
+        # 说明锁已过期被重试方接管,本次执行放弃 store,避免旧响应覆盖新执行者的响应。
+        owned = await idempotency.release(state.redis, idem_sk, idem_token)
+        if owned:
+            await idempotency.store(
+                state.redis, idem_sk, resp.status_code, body_json,
+                state.settings.idempotency_ttl_seconds,
+            )
     return Response(
         content=resp.content,
         status_code=resp.status_code,

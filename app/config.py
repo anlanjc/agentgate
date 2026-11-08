@@ -43,6 +43,9 @@ class Settings(BaseSettings):
 
     # Idempotency-Key 响应重放留存时长(重试窗口;仅非流式,见 app/idempotency.py)
     idempotency_ttl_seconds: int = 86_400
+    # 幂等锁 TTL(GW-3):必须 ≥ 渠道 read_timeout 上限 —— 锁活不过合法执行期,
+    # 重试就会并发执行双计费。心跳续租不做(复杂度不划算),配足 TTL 即覆盖。
+    idempotency_lock_ttl_seconds: int = 300
 
     # 成本价目表(P4):JSON 串,模型 → {input, output}(元/百万 token);
     # 未登记的模型账本 cost=NULL(不猜价)。改价需重启(运行时热更不做,诚实边界)
