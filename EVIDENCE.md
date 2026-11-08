@@ -6,7 +6,7 @@
 
 ## ① 测试证据
 
-- **67/67 全绿(SQLite 方言)+ 67/67 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,AG-2 终态)
+- **67/67 全绿(SQLite 方言)+ 67/67 全绿(PostgreSQL 16.2 真库,pgserver)—— 双口径** (2026-11-03,AG-2 历史快照;现口径以下方「终态」节为准)
   - 命令:`.venv/Scripts/python -m pytest tests -q`;PG 口径:`AGENTGATE_TEST_PG=1` 同命令
   - 组成:M0 协议代理 12 · M1 鉴权 7+限流 7+配额 8 · M2 故障转移 6+Streams 7 · M4 渠道注册 1 · M5 缓存 7+语义 6+MCP 1 · M6 持久化 3+追踪 2
   - 其中 4 项为真 Redis 集成口径(redis_client fixture,flavor=real);Redis 不可用时诚实 skip
@@ -181,13 +181,13 @@
 - **P4-3 K8s 清单**(deploy/k8s):Deployment(2 副本双探针非 root)/Service/HPA(2~10,CPU 70%)/ConfigMap/Secret 模板;有意不含 PG/Redis StatefulSet(托管优先);**未实跑诚实标注**。
 - **P4-4 pgvector 后端**:内嵌 PG 16.2 自带 vector 0.6.2 → 真实现(app/cache/semantic_pg.py):幂等建表+HNSW、KNN 召回、降级当 miss;`semantic_backend=redis|pgvector` 双后端,SQLite 口径诚实 skip。**顺手修 PG 连接池卫生真 bug**:95+ 测试 × 每 app 连接池不释放 → too many clients;fixture teardown 统一 engine.dispose()。
 
-### 终态(2026-11-04,最后提交后复测)
+### 终态(2026-11-09,评审 2.0 修复批 GW-3~GW-12 后复测;全库唯一「终态」口径)
 
-- **SQLite:95 passed + 2 skipped**(pgvector 是 PG 专属口径,skip=诚实标注)
-- **PostgreSQL 16.2:97 passed**(含 pgvector KNN 往返+租户隔离)
-- ruff 全绿;Alembic 迁移链 3215fe6889f5→7c1f4a9b2d10→a3d94f1c7b21→c8e51b09d447→e6f22c81a903→f9a37c2d5b84 真 PG 验证
-- git:main 分支 22 笔提交(自 747f471 起),工作树干净
-- 剩余边界:compose/k8s 未实跑(等 Docker/集群)、AskBI 实接(等跨项目授权)、预算百分比预警、PG 分区
+- **SQLite:121 passed + 2 skipped**(pgvector 是 PG 专属口径,skip=诚实标注)
+- **PostgreSQL 16.2:123 passed**(含 pgvector KNN 往返+租户隔离)
+- 历史快照:2026-11-03 为 67×2;2026-11-04 为 95+2skip / 97 —— 测试数随批次增长,以本节为准
+- ruff 全绿;Alembic 迁移链 3215fe6889f5→7c1f4a9b2d10→a3d94f1c7b21→c8e51b09d447→e6f22c81a903→f9a37c2d5b84→b4c19d2e6f78→d7e5a9c31b42 真 PG 验证
+- 剩余边界:compose/k8s 未实跑(等 Docker/集群;GW-7 已补 compose 主密钥强制+静态回归,容器冒烟待部署日)、AskBI 实接(等跨项目授权)、预算百分比预警、PG 分区
 
 ## ⑩ 收尾自查批次(2026-11-04,AG-2)——"还有没有改进"的答案
 
@@ -196,4 +196,4 @@
 - **webhook HMAC 签名**(迁移 b4c19d2e6f78):`X-Agentgate-Signature: sha256=HMAC(secret, "{ts}.{body}")`+时间戳防重放;租户 webhook_secret 列+轮换端点(审计留痕);无 secret 不签名(向后兼容)。测试:真 HTTP 接收端验签+篡改不通过。
 - **requirements.lock**(pip freeze 78 行)+ CI 双 job 改锁文件安装——依赖可复现。
 - **管理台补审计流水卡片+账单 CSV 导出按钮**;截图重拍(11-02 旧 UI 过期):管理台(token 输入/双渠道健康/key 签发/对账/**审计流水**/**导出 CSV**)+ Playground(流式实测 TTFT 16ms/总延迟 33ms/BYPASS/usage 11/7/18)。本地 mock 栈零花费;IAB 截图管线 fullPage/clip 有 stride 重影 bug→定长视口直拍+冻结定时器规避。
-- 终态:97 passed + 2 skipped(SQLite 全量)/ ruff 全绿;git main 26 笔提交,工作树干净。
+- 批次收尾复测(2026-11-04 历史口径):97 passed + 2 skipped(SQLite 全量)/ ruff 全绿;git main 26 笔提交,工作树干净。现口径见上方「终态」节。

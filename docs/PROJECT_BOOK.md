@@ -9,7 +9,7 @@
 virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理、故障转移和 Streams
 异步任务。它是 IO 密集型系统——瓶颈在上游模型的秒级延迟,所以我用 Python/FastAPI,
 压测的每请求附加开销是 3.55 毫秒;多进程水平扩展 1→4 worker 是 4.95 倍近线性,因为共享
-状态全部在 Redis。95+97 项测试双数据库口径全绿,真实 PolicyCompass 已经接在它后面跑。"
+状态全部在 Redis。123 项测试双数据库口径全绿(SQLite 121+2skip / PG 123),真实 PolicyCompass 已经接在它后面跑。"
 
 ## 1. 高频问题 → 深挖点 → 证据
 
@@ -35,7 +35,7 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 
 ### Q5 上游挂了怎么办?
 - 一句话:故障转移状态机——连接类错误立即切下一渠道并冷却 60s;429 立即冷却并尊重 Retry-After;EMA 延迟优先路由;全渠道冷却返回 503+Retry-After。
-- 深挖:流式下的语义难题(chunk 已发出不可回滚→SSE error 事件如实透传,LiteLLM 同款 caveat);**kill -9 真实演练 10ms 切换**;故障注入抓到的真 bug(ReadError 漏接成 500)说明"演练的价值"。
+- 深挖:流式下的语义难题(chunk 已发出不可回滚→SSE error 帧统一信封+截断不发 [DONE],LiteLLM 同款 caveat);**kill -9 真实演练 2047ms 切换**(同模型池双渠道,含 RST+冷却+重试周期,10ms 是旧口径);故障注入抓到的真 bug(ReadError 漏接成 500)说明"演练的价值"。
 - 证据:demo_ecosystem.py;test_upstream_connection_reset_maps_502。
 
 ### Q6 缓存怎么设计的?(穿透/击穿/雪崩)
@@ -86,7 +86,7 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 1. 响应缓存是精确匹配;语义缓存为可插拔 embedder+双后端(测试 HashEmbedder=词面 bigram 仅开发口径,生产 DashScope embedding;默认 Redis 暴力余弦 ≤200 条,`semantic_backend=pgvector` 换 KNN/HNSW 已实现)。
 2. TPM 已升级双窗口加权滑动近似(消除固定窗口突刺);精确滑动日志在 backlog。
 3. 预算是计量制不是预扣制;严格预扣需要估算 token,误差同样存在——取舍写在 ADR-002。
-4. SQLite 是测试方言,生产 PG;双口径 95+97 全绿(pgserver 内嵌 PG 16.2 复跑),PG 分区等特性在 backlog。
+4. SQLite 是测试方言,生产 PG;双口径 123 全绿(SQLite 121+2skip / pgserver 内嵌 PG 16.2 复跑 123),PG 分区等特性在 backlog。
 5. PC 接入的 shim 不上报 usage(PC 无 token 计量),账本 token=0 是诚实记录不是缺陷。
 6. 管理台无鉴权 UI 层(admin_token 保护 API,页面本身内网用);生产加 SSO 在 backlog。
 
@@ -95,6 +95,6 @@ virtual key 鉴权、Redis+Lua 分布式限流、配额计费、SSE 流式代理
 1. `python scripts/demo_admin.py` → 打开 /admin/web:渠道健康(EMA 实测)、租户、签发 key(只显示一次)、用量对账。
 2. curl 一发非流式 + 一发流式(SSE 逐字)。
 3. 用超小 budget 的 key 触发 402;超小 rpm 触发 429 + Retry-After。
-4. `python scripts/demo_ecosystem.py` → kill -9 agent-a → 10ms 切换 agent-b。
+4. `python scripts/demo_ecosystem.py` → kill -9 agent-a → 2047ms 切换 agent-b(重测口径,见 EVIDENCE §⑨)。
 5. `python scripts/demo_pc_gateway.py` → 真 PolicyCompass 答社保公积金问题。
-6. /metrics 看 TTFT/缓存命中;pytest 47 绿 + PG 口径复跑收尾。
+6. /metrics 看 TTFT/缓存命中;pytest 121+2skip(SQLite)+ PG 口径 123 复跑收尾。
