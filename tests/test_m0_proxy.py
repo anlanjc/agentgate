@@ -185,10 +185,19 @@ async def test_upstream_connection_reset_maps_502(settings, redis_client):
         await server.wait_closed()
 
 
-async def test_validation_error_422(gateway):
+async def test_validation_error_unified_envelope(gateway):
+    """GW-11 回归:请求校验错误并入统一 error 信封(400 对齐 OpenAI)——
+    修复前走 FastAPI 默认 422 + detail 数组,与 401/429/503 的信封并存两套契约。"""
     client, app, _ = gateway
     resp = await client.post("/v1/chat/completions", json={"model": "mock-model", "messages": []})
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    envelope = resp.json()
+    assert set(envelope.keys()) == {"error"}
+    err = envelope["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "invalid_request_body"
+    assert err["request_id"]
+    assert "messages" in err["message"]  # 字段定位进 message
 
 
 async def test_models_list(gateway):

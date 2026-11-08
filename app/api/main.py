@@ -14,7 +14,7 @@ from app.api.admin import router as admin_router
 from app.api.v1_chat import router as v1_router
 from app.config import Settings, get_settings
 from app.db.session import build_engine, build_session_factory
-from app.errors import GatewayError, gateway_error_handler
+from app.errors import GatewayError, gateway_error_handler, validation_error_handler
 from app.log import configure_logging, get_logger
 from app.middleware import RequestContextMiddleware
 from app.upstream.client import UpstreamClient
@@ -157,6 +157,10 @@ def create_app(
 
     app_.add_middleware(RequestContextMiddleware)
     app_.add_exception_handler(GatewayError, gateway_error_handler)
+    # GW-11:请求校验错误(422 默认信封)并入统一 error 信封(400 对齐 OpenAI)
+    from fastapi.exceptions import RequestValidationError
+
+    app_.add_exception_handler(RequestValidationError, validation_error_handler)
     app_.include_router(v1_router)
     app_.include_router(admin_router)
 
