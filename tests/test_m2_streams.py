@@ -307,3 +307,114 @@ def _collect_with(received: list):
         received.append({"type": task_type, **payload})
         return {"ok": True}
     return handler
+
+
+# ---------- GW-4(评审 2.0)回归:终态回写状态守卫 + 租约时钟统一 ----------
+
+
+async def test_terminal_write_lost_race_keeps_winner_result(queue_env):
+    """GW-4 回归(done 守卫):另一副本已写 done 时,本副本收尾不得覆盖事实。
+
+    修复前终态回写只按 id 无条件 UPDATE —— 双副本接管场景下后写者翻转前写者的
+    终态/结果。修复后带 status='processing' 守卫,rowcount=0 放弃写入,消息不 ACK,
+    由 reclaim 按"已 done"幂等清理。"""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select, update
+
+    from app.db.models import TaskRecord
+
+    q, sf, received, redis = queue_env
+
+    async def racing_handler(task_type: str, payload: dict) -> dict:
+        # 模拟接管副本在本次 handler 执行期间抢先写终态
+        async with sf() as db:
+            await db.execute(
+                update(TaskRecord).where(TaskRecord.status == "processing")
+                .values(status="done", result={"winner": "other-copy"})
+            )
+            await db.commit()
+        return {"winner": "this-copy"}
+
+    q._handler = racing_handler
+    async with sf() as db:
+        tid = await q.enqueue(db, "t", {"x": 1}, idempotency_key="gw4-done-race")
+
+    await q.flush()  # 含 reclaim 清理:消息最终被"已 done"检查 ACK+DEL
+
+    async with sf() as db:
+        row = (await db.execute(select(TaskRecord).where(TaskRecord.id == tid))).scalar_one()
+    assert row.status == "done"
+    assert row.result == {"winner": "other-copy"}  # 接管者的结果,未被覆盖
+    assert q.processed == 0  # 本副本输掉竞争:不计 processed
+    assert await redis.xlen(TASK_STREAM) == 0  # 消息已被幂等清理
+
+
+async def test_dead_write_lost_race_no_false_dlq(queue_env):
+    """GW-4 回归(dead 守卫):副本已把任务写成 done,失败副本不得再投假死信、
+    不得把 done 翻回 dead(修复前死信回写无守卫)。"""
+    from sqlalchemy import select, update
+
+    from app.db.models import TaskRecord
+
+    q, sf, received, redis = queue_env
+    q._auto_start = False  # 保住"先改 attempts 再投递"的时序
+
+    async def racing_bad_handler(task_type: str, payload: dict) -> dict:
+        async with sf() as db:
+            await db.execute(
+                update(TaskRecord).where(TaskRecord.status == "processing")
+                .values(status="done", result={"winner": "other-copy"})
+            )
+            await db.commit()
+        raise RuntimeError("boom after takeover")
+
+    q._handler = racing_bad_handler
+    async with sf() as db:
+        tid = await q.enqueue(db, "t", {"x": 1}, idempotency_key="gw4-dead-race")
+        await db.execute(update(TaskRecord).where(TaskRecord.id == tid).values(attempts=2))
+        await db.commit()
+
+    await q.start()
+    await q.flush()
+
+    async with sf() as db:
+        row = (await db.execute(select(TaskRecord).where(TaskRecord.id == tid))).scalar_one()
+    assert row.status == "done"  # 未被翻成 dead
+    assert row.result == {"winner": "other-copy"}
+    assert q.dead == 0
+    assert await redis.xlen(DLQ_STREAM) == 0  # 没有假死信
+    assert await redis.xlen(TASK_STREAM) == 0
+
+
+async def test_lease_timestamp_uses_redis_clock_not_local(queue_env, monkeypatch):
+    """GW-4 回归(租约时钟):把本进程本地时钟拨快 120s,updated_at 仍取
+    Redis 服务器时钟 —— 修复前各副本用本地 _utcnow() 写租约、又用本地时钟
+    比对别副本的租约,快钟副本会在慢钟副本 handler 执行中提前接管。"""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import TaskRecord
+    from app.queue import streams as streams_mod
+
+    q, sf, received, redis = queue_env
+
+    real_utcnow = streams_mod._utcnow
+
+    def skewed():
+        return real_utcnow() + timedelta(seconds=120)
+
+    monkeypatch.setattr(streams_mod, "_utcnow", skewed)
+
+    async with sf() as db:
+        tid = await q.enqueue(db, "t", {"x": 1}, idempotency_key="gw4-clock")
+    await q.flush()
+
+    async with sf() as db:
+        row = (await db.execute(select(TaskRecord).where(TaskRecord.id == tid))).scalar_one()
+    r_sec, _ = await redis.time()
+    redis_now = datetime.fromtimestamp(r_sec, tz=UTC)
+    updated = row.updated_at if row.updated_at.tzinfo else row.updated_at.replace(tzinfo=UTC)
+    # 若用的是被拨快的本地时钟,偏差会是 120s —— 断言钉住"必须来自 Redis 时钟"
+    assert abs(updated - redis_now) < timedelta(seconds=5)

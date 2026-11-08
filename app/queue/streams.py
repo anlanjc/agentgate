@@ -8,6 +8,10 @@
   attempts +1,超过 max_attempts → XADD 死信流 + XACK + status=dead;
 - 幂等:消费端用条件 UPDATE 原子抢占(同一 task_id 不会被两个消费者同时执行),
   账本再用 (tenant_id, request_id) 唯一键兜底;
+- 状态机守卫(GW-4):抢占与终态回写(done/dead/pending)全部是带 status 前置条件
+  的 UPDATE —— rowcount=0 说明另一副本已接管/已写终态,本次结果放弃,不覆盖事实;
+- 租约时钟(GW-4):抢占与终态时间戳统一取 Redis 服务器时钟(TIME)——各副本
+  本地时钟偏差 ≥ claim_idle 时,快钟副本会在慢钟副本 handler 执行中就抢占接管;
 - 语义诚实声明:投递是 at-least-once,副作用必须幂等;队列本身不承诺 exactly-once。
 
 为什么 XACK 后还要 XDEL:XLEN 会把已 ACK 的历史消息也算进 backlog,队列深度只增不减,
@@ -41,6 +45,20 @@ MAINTENANCE_INTERVAL_SECONDS = 2.0
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+async def _redis_now(redis) -> datetime:
+    """Redis 服务器时钟(GW-4):跨副本租约判定的统一时间源。
+
+    本地时钟只属于本进程 —— 双副本部署(k8s replicas=2)下 A/B 各自的
+    datetime.now() 偏差会直接变成租约判定偏差。Redis 拿不到(故障/测试桩)
+    退回本地时钟:单副本/测试口径无跨副本问题,降级安全。
+    """
+    try:
+        seconds, micros = await redis.time()
+        return datetime.fromtimestamp(seconds + micros / 1_000_000, tz=UTC)
+    except Exception:
+        return _utcnow()
 
 
 class TaskQueue:
@@ -342,7 +360,10 @@ class TaskQueue:
             # 先在 UPDATE 前记下旧值:SQLAlchemy 的 synchronize_session 会把
             # record.attempts 原地改成新值,更新后再 +1 会多算一次。
             prev_attempts = int(record.attempts)
-            stale_cutoff = _utcnow() - timedelta(milliseconds=self._claim_idle_ms)
+            # GW-4:租约时钟统一用 Redis TIME —— stale_cutoff 与 updated_at 必须
+            # 和"别副本写入的 updated_at"同一时间源,本地时钟偏差会变成误接管。
+            now = await _redis_now(self._redis)
+            stale_cutoff = now - timedelta(milliseconds=self._claim_idle_ms)
             claimed = await db.execute(
                 update(TaskRecord)
                 .where(
@@ -358,7 +379,7 @@ class TaskQueue:
                 .values(
                     status="processing",
                     attempts=TaskRecord.attempts + 1,
-                    updated_at=_utcnow(),
+                    updated_at=now,
                 )
             )
             await db.commit()
@@ -369,28 +390,46 @@ class TaskQueue:
 
             try:
                 result = await self._handler(task_type, payload)
-                await db.execute(
+                # GW-4:终态回写带 status='processing' 守卫 —— rowcount=0 说明
+                # 另一副本已接管或已写终态,本次结果放弃(不覆盖事实)。消息不 ACK,
+                # 留在 PEL 由 reclaim 按状态幂等清理(已 done/dead 则 ACK+DEL)。
+                done = await db.execute(
                     update(TaskRecord)
-                    .where(TaskRecord.id == task_id)
-                    .values(status="done", result=result, updated_at=_utcnow())
+                    .where(TaskRecord.id == task_id, TaskRecord.status == "processing")
+                    .values(
+                        status="done",
+                        result=result,
+                        updated_at=await _redis_now(self._redis),
+                    )
                 )
                 await db.commit()
+                if done.rowcount != 1:
+                    logger.warning(
+                        "task_done_write_lost_race", task_id=task_id, attempts=attempts
+                    )
+                    return
                 await self._ack_and_delete(msg_id)
                 self.processed += 1
                 logger.info("task_done", task_id=task_id, attempts=attempts, reclaimed=reclaimed)
             except Exception as exc:
                 # 失败不 ACK:留在 PEL 等待 reclaim 重试;超过上限进死信。
                 if attempts >= self._max_attempts:
-                    await db.execute(
+                    # GW-4:dead 回写同样带守卫,防止"副本 B 的 done 被副本 A 翻成 dead+假死信"。
+                    dead = await db.execute(
                         update(TaskRecord)
-                        .where(TaskRecord.id == task_id)
+                        .where(TaskRecord.id == task_id, TaskRecord.status == "processing")
                         .values(
                             status="dead",
                             result={"error": str(exc)},
-                            updated_at=_utcnow(),
+                            updated_at=await _redis_now(self._redis),
                         )
                     )
                     await db.commit()
+                    if dead.rowcount != 1:
+                        logger.warning(
+                            "task_dead_write_lost_race", task_id=task_id, attempts=attempts
+                        )
+                        return
                     await self._redis.xadd(
                         DLQ_STREAM,
                         {"task_id": task_id, "type": task_type, "error": str(exc)[:500]},
@@ -405,12 +444,18 @@ class TaskQueue:
                         logger.warning("task_dead_metric_failed", error=str(metric_exc))
                     logger.warning("task_dead", task_id=task_id, attempts=attempts, error=str(exc))
                 else:
-                    await db.execute(
+                    # GW-4:pending 回写同守卫 —— 另一副本可能已把它写成 done/pending。
+                    retried = await db.execute(
                         update(TaskRecord)
-                        .where(TaskRecord.id == task_id)
-                        .values(status="pending", updated_at=_utcnow())
+                        .where(TaskRecord.id == task_id, TaskRecord.status == "processing")
+                        .values(status="pending", updated_at=await _redis_now(self._redis))
                     )
                     await db.commit()
+                    if retried.rowcount != 1:
+                        logger.warning(
+                            "task_retry_write_lost_race", task_id=task_id, attempts=attempts
+                        )
+                        return
                     logger.info(
                         "task_retry_scheduled", task_id=task_id, attempts=attempts, error=str(exc)
                     )
