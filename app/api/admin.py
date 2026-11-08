@@ -344,6 +344,24 @@ def _validate_base_url(base_url: str) -> None:
         )
 
 
+def _validate_read_timeout_vs_lock_ttl(read_timeout: float, settings) -> None:
+    """GW-14:渠道读超时不得超过幂等锁 TTL —— 否则带 Idempotency-Key 的请求
+    执行超过 TTL,锁过期、重试 SETNX 成功与首请求并发执行(GW-3 原始病灶)。
+    属主 token 只防"删别人的锁/覆盖 store",防不住双执行本身;不变量必须在
+    注册边界硬校验(注释会过期,400 不会)。"""
+    lock_ttl = settings.idempotency_lock_ttl_seconds
+    if read_timeout > lock_ttl:
+        raise GatewayError(
+            400,
+            f"channel read_timeout ({read_timeout}s) exceeds idempotency lock TTL "
+            f"({lock_ttl}s): lock would expire mid-execution and a retry would run "
+            "concurrently (double billing). Lower read_timeout or raise "
+            "AGENTGATE_IDEMPOTENCY_LOCK_TTL_SECONDS.",
+            "invalid_request_error",
+            "read_timeout_exceeds_idem_ttl",
+        )
+
+
 @router.post("/channels")
 async def register_channel(body: ChannelCreate, request: Request) -> dict:
     """把任意 OpenAI 兼容服务注册为网关渠道(含自家 Agent 应用),无需重启。
@@ -353,6 +371,7 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     """
     _require_admin(request)
     _validate_base_url(body.base_url)
+    _validate_read_timeout_vs_lock_ttl(body.read_timeout, request.app.state.settings)
 
     import uuid as _uuid
 

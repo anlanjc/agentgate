@@ -52,6 +52,14 @@ async def load_channels_from_db(app_: FastAPI) -> int:
             read_timeout=ch.read_timeout,
             trust_env=settings.llm_trust_env,
         )
+        if ch.read_timeout > settings.idempotency_lock_ttl_seconds:
+            # GW-14:存量行守卫(注册闸是后加的,老库里可能有超 TTL 的长超时渠道)
+            # —— 不拦截(渠道可用性优先),但必须留痕:幂等重试在该渠道上可能双执行。
+            logger.warning(
+                "channel_read_timeout_exceeds_idem_ttl",
+                channel=ch.name, read_timeout=ch.read_timeout,
+                lock_ttl=settings.idempotency_lock_ttl_seconds,
+            )
         router.register(ch.name, client, ch.models)
         restored += 1
     if restored:

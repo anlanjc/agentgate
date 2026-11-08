@@ -166,3 +166,47 @@ async def test_bad_url_channel_fails_over_instead_of_500(auth_gateway):
     assert r2.json()["error"]["code"] == "upstream_invalid_url"
     await bad.aclose()
     await worse.aclose()
+
+
+# ---------- GW-14(评审 3.0)回归:锁 TTL ≥ 渠道读超时的不变量落成硬约束 ----------
+
+
+def test_settings_rejects_lock_ttl_below_read_timeout():
+    """GW-14 回归(config 校验器):锁 TTL < 默认渠道读超时 → 启动即拒。
+    修复版不变量只在注释里(且缺省 300==300 零余量),配置漂移无任何守卫。"""
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError, match="IDEMPOTENCY_LOCK_TTL"):
+        Settings(_env_file=None, idempotency_lock_ttl_seconds=100, upstream_read_timeout=300)
+    # 正常组合(含缺省 450 = 300 × 1.5 余量)放行
+    s = Settings(_env_file=None, idempotency_lock_ttl_seconds=600, upstream_read_timeout=300)
+    assert s.idempotency_lock_ttl_seconds == 600
+
+
+async def test_register_channel_rejects_read_timeout_over_lock_ttl(auth_gateway):
+    """GW-14 回归(注册闸):read_timeout=600 > 锁 TTL → 400 统一信封
+    (修复前完全合法地注册成功,锁 300s 先死,重试并发执行 GW-3 原始场景重现)。"""
+    client, app, mock, raw = auth_gateway
+    h = {**auth_headers(raw), "X-Admin-Token": ""}
+    r = await client.post(
+        "/admin/channels",
+        json={"name": "slow-channel", "base_url": "http://slow/v1",
+              "models": ["mock-model"], "read_timeout": 10_000},
+        headers=h,
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"]["code"] == "read_timeout_exceeds_idem_ttl"
+    assert "AGENTGATE_IDEMPOTENCY_LOCK_TTL_SECONDS" in body["error"]["message"]
+    assert "slow-channel" not in app.state.channel_router.names  # 未注册
+
+    # 边界内(≤ TTL)仍可注册
+    ok = await client.post(
+        "/admin/channels",
+        json={"name": "edge-channel", "base_url": "http://edge/v1",
+              "models": [], "read_timeout": 450},
+        headers=h,
+    )
+    assert ok.status_code == 200, ok.text

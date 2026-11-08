@@ -50,7 +50,11 @@ class Settings(BaseSettings):
     idempotency_ttl_seconds: int = 86_400
     # 幂等锁 TTL(GW-3):必须 ≥ 渠道 read_timeout 上限 —— 锁活不过合法执行期,
     # 重试就会并发执行双计费。心跳续租不做(复杂度不划算),配足 TTL 即覆盖。
-    idempotency_lock_ttl_seconds: int = 300
+    # GW-14:该不变量不在注释里守,在两处硬闸守 —— ①下方 _validate_lock_covers_read_timeout
+    # 校验器(默认渠道,启动期 fail-closed);②admin 渠道注册端点(自建渠道,注册时 400)。
+    # 缺省 450 = 默认读超时 300 的 1.5x —— 修复版 300==300 零余量,执行满 300s 的请求
+    # 收尾时锁恰好过期,compare-and-delete 返回 False,成功响应放弃进重放库。
+    idempotency_lock_ttl_seconds: int = 450
 
     # 成本价目表(P4):JSON 串,模型 → {input, output}(元/百万 token);
     # 未登记的模型账本 cost=NULL(不猜价)。改价需重启(运行时热更不做,诚实边界)
@@ -99,6 +103,18 @@ class Settings(BaseSettings):
                 f"AGENTGATE_ENVIRONMENT={self.environment}(非白名单环境)时必须设置"
                 " AGENTGATE_CHANNEL_ENC_KEY(渠道密钥静态加密主密钥,"
                 "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" 生成)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lock_covers_read_timeout(self):
+        # GW-14:幂等锁 TTL 必须 ≥ 默认渠道读超时(所有环境,与 fail-closed 同款
+        # 启动期硬约束)—— 锁比合法执行期先死,重试就并发执行双计费(GW-3 原始病灶)。
+        if self.idempotency_lock_ttl_seconds < self.upstream_read_timeout:
+            raise ValueError(
+                f"AGENTGATE_IDEMPOTENCY_LOCK_TTL_SECONDS({self.idempotency_lock_ttl_seconds})"
+                f" 必须 ≥ AGENTGATE_UPSTREAM_READ_TIMEOUT({self.upstream_read_timeout}):"
+                "幂等锁必须活过最长合法执行期,否则重试并发执行双计费"
             )
         return self
 
