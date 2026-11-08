@@ -50,6 +50,32 @@ def test_empty_secret_passthrough():
     assert encrypt_secret("") == "" and decrypt_secret("") == ""
 
 
+def test_environment_fail_closed_unknown_names_treated_as_prod():
+    """GW-6 回归:prod 校验器从精确匹配反转白名单豁免 —— 'production'/'live'/
+    'main' 等任何未识别环境名一律按 prod 校验(缺 admin_token 即拒绝启动),
+    修复前这些变体静默跳过三道安全闸。"""
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    # 未识别环境名 + 空 admin_token:必须拒绝(修复前直接 return,管理面裸奔上线)
+    for env in ("prod", "production", "live", "main", "PROD", "Production", "unknown-env", ""):
+        with pytest.raises(ValidationError, match="ADMIN_TOKEN"):
+            Settings(_env_file=None, environment=env)
+
+    # 白名单环境:豁免校验(dev 缺省态可启动)
+    for env in ("dev", "test", "testing", "staging", "local", "DEV", "Staging"):
+        s = Settings(_env_file=None, environment=env)
+        assert s.environment == env
+
+    # 未识别环境名补齐安全配置后应可启动(校验的是闸门存在,不是一刀切禁用)
+    s = Settings(
+        _env_file=None, environment="production", admin_token="strong-token",
+        channel_enc_key=crypto.generate_key(),
+    )
+    assert s.environment == "production"
+
+
 def test_prod_requires_channel_enc_key():
     """prod fail-closed:渠道密钥明文口径不允许上生产(与 admin_token 同款)。"""
     from pydantic import ValidationError

@@ -5,12 +5,17 @@ from functools import lru_cache
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# GW-6:非生产环境白名单 —— 只有显式列出的名字豁免安全闸校验;'production'/
+# 'live'/'main' 等任何未识别值一律按 prod 校验(fail-closed 反转,误配必报错)。
+NON_PROD_ENVIRONMENTS = frozenset({"dev", "test", "testing", "staging", "local"})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTGATE_", env_file=".env", extra="ignore")
 
     app_name: str = "agentgate"
-    environment: str = "dev"  # prod 时强制 admin_token,拒绝"部署了但管理面裸奔"
+    # 不在白名单(dev/test/testing/staging/local)内的环境名一律按 prod 强制校验
+    environment: str = "dev"
     host: str = "127.0.0.1"
     port: int = 8100
     log_level: str = "INFO"
@@ -74,18 +79,26 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _fail_closed_in_prod(self):
-        if self.environment.lower() != "prod":
+        # GW-6(评审 2.0):原实现 `environment != 'prod' 即 return` —— 精确匹配
+        # 意味着 'production'/'live'/'main' 等任何变体都静默跳过 admin_token/
+        # auth_enabled/channel_enc_key 三道安全闸,误配无任何提示。反转为白名单
+        # 豁免:不在 NON_PROD_ENVIRONMENTS 里的一律按 prod 校验(fail-closed)。
+        if self.environment.lower() in NON_PROD_ENVIRONMENTS:
             return self
         if not self.admin_token or self.admin_token in {"change-me", "changeme"}:
             raise ValueError(
-                "AGENTGATE_ENVIRONMENT=prod 时必须设置非默认 AGENTGATE_ADMIN_TOKEN"
+                f"AGENTGATE_ENVIRONMENT={self.environment}(非 dev/test/staging/local 白名单)"
+                "时必须设置非默认 AGENTGATE_ADMIN_TOKEN"
             )
         if not self.auth_enabled:
-            raise ValueError("AGENTGATE_ENVIRONMENT=prod 时禁止关闭 auth_enabled")
+            raise ValueError(
+                f"AGENTGATE_ENVIRONMENT={self.environment}(非白名单环境)禁止关闭 auth_enabled"
+            )
         if not self.channel_enc_key:
             raise ValueError(
-                "AGENTGATE_ENVIRONMENT=prod 时必须设置 AGENTGATE_CHANNEL_ENC_KEY"
-                "(渠道密钥静态加密主密钥,cryptography.fernet.Fernet.generate_key() 生成)"
+                f"AGENTGATE_ENVIRONMENT={self.environment}(非白名单环境)时必须设置"
+                " AGENTGATE_CHANNEL_ENC_KEY(渠道密钥静态加密主密钥,"
+                "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" 生成)"
             )
         return self
 
