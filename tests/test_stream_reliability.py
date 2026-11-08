@@ -23,6 +23,7 @@ from app.auth.keys import generate_key
 from app.db.models import Tenant, UsageRecord, VirtualKey
 from app.db.session import init_db
 from app.upstream.client import UpstreamClient
+from tests.conftest import auth_headers
 
 
 def build_slow_tail_upstream(tail_delay: float = 0.5) -> FastAPI:
@@ -255,3 +256,57 @@ async def test_stream_normal_completion_no_double_accounting(auth_settings, redi
         await app.state.task_queue.stop()
         await upstream.aclose()
         await app.state.engine.dispose()
+
+
+# ---------- GW-9(评审 2.0)回归:SSE 异常帧统一信封 + 干净截断探测 ----------
+
+
+async def test_stream_break_yields_unified_error_frame_and_502_ledger(auth_gateway):
+    """GW-9 回归(干净截断):上游 stream_break(发一半关流,无 [DONE])——
+    修复前 relay 正常走完、无任何异常标记、账本静默记 200。
+    修复后:补发 event: error + 统一错误信封(code=stream_truncated_no_done,
+    含 request_id),账本记 502,响应中无 [DONE]。"""
+    import json as json_mod
+
+    from app.db.models import UsageRecord
+
+    client, app, mock, raw = auth_gateway
+    r = await client.post(
+        "/v1/chat/completions",
+        json={"model": "mock-model", "messages": [{"role": "user", "content": "hi"}],
+              "stream": True, "stream_options": {"include_usage": True}},
+        headers={**auth_headers(raw), "X-Mock-Case": "stream_break"},
+    )
+    assert r.status_code == 200  # 响应头已提交(SSE),终态在帧与账本里如实标注
+    body = r.content
+    assert b"data: [DONE]" not in body  # 截断流不发 [DONE](判据契约)
+    assert b"event: error" in body
+    # 最后一帧 data 是统一信封(与 HTTP 错误同构,含 request_id)
+    last_data = [ln for ln in body.split(b"\n") if ln.startswith(b"data: ")][-1]
+    envelope = json_mod.loads(last_data[len(b"data: "):])
+    assert envelope["error"]["type"] == "bad_gateway"
+    assert envelope["error"]["code"] == "stream_truncated_no_done"
+    assert envelope["error"]["request_id"]
+
+    await app.state.task_queue.flush()
+    async with app.state.session_factory() as db:
+        from sqlalchemy import select
+
+        rows = (await db.execute(select(UsageRecord))).scalars().all()
+    assert len(rows) == 1 and rows[0].status == 502  # 账本不静默记 200
+
+
+async def test_sse_error_frame_shape_is_gateway_envelope():
+    """GW-9 单元回归:异常帧构造器输出网关统一信封(SSE 承载),非自定义 schema。"""
+    from app.api.v1_chat import _sse_error_frame
+
+    frame = _sse_error_frame("boom mid-stream", "upstream_read_error_midstream")
+    assert frame.startswith(b"event: error\ndata: ")
+    assert frame.endswith(b"\n\n")
+    import json as json_mod
+
+    payload = json_mod.loads(frame[len(b"event: error\ndata: "):-2].decode())
+    assert payload["error"]["message"] == "boom mid-stream"
+    assert payload["error"]["type"] == "bad_gateway"
+    assert payload["error"]["code"] == "upstream_read_error_midstream"
+    assert "request_id" in payload["error"]

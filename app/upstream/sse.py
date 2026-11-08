@@ -42,11 +42,14 @@ class SSELineParser:
     """旁观解析完整 SSE data: 行,产出 JSON payload(仅用于提取 usage 等元数据)。
 
     纪律:解析器与转发器解耦 —— 转发仍走原始字节(零改动),解析只旁观副本。
+    saw_done(GW-9):是否见过 [DONE] 终止标记 —— 流正常结束的判据;干净截断
+    (上游关流但没发 [DONE])据此补发 error 帧并改账本口径,不再静默记 200。
     """
 
     def __init__(self, max_buffer: int = 262_144) -> None:
         self._buf = b""
         self._max_buffer = max_buffer
+        self.saw_done = False
 
     def feed(self, chunk: bytes) -> list[dict]:
         """喂入原始字节,返回本次凑齐的完整 data: JSON payload 列表。"""
@@ -62,8 +65,11 @@ class SSELineParser:
             stripped = line.strip()
             if not stripped.startswith(b"data:"):
                 continue
+            if stripped == DONE_MARKER:
+                self.saw_done = True
+                continue
             body = stripped[len(b"data:"):].strip()
-            if not body or body == b"[DONE]":
+            if not body:
                 continue
             try:
                 import json
@@ -75,11 +81,18 @@ class SSELineParser:
 
 
 class UsageAccumulator:
-    """从 SSE 流中提取最终 usage(上游 include_usage 语义:最后一个带 usage 的事件为准)。"""
+    """从 SSE 流中提取最终 usage(上游 include_usage 语义:最后一个带 usage 的事件为准)。
+
+    saw_done(GW-9):透传解析器的是否见过 [DONE] —— relay 据此探测干净截断。
+    """
 
     def __init__(self) -> None:
         self._parser = SSELineParser()
         self.usage: dict | None = None
+
+    @property
+    def saw_done(self) -> bool:
+        return self._parser.saw_done
 
     def feed(self, chunk: bytes) -> None:
         for payload in self._parser.feed(chunk):

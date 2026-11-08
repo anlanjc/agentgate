@@ -349,6 +349,26 @@ def _idempotency_key(kind: str, auth: AuthResult | None, request_id: str) -> str
     return f"{kind}:{tenant}:{request_id}"
 
 
+def _sse_error_frame(message: str, code: str) -> bytes:
+    """GW-9:mid-stream 异常帧 = 网关统一错误信封(与 HTTP 错误同构,SSE data 行承载)。
+
+    SSE 契约(README「硬点 6」):
+    - 正常完成:...data 帧... `data: [DONE]`,无 error 帧;
+    - 异常终止(上游断流/读错误/干净截断):不发 [DONE],最后一帧是
+      `event: error` + 统一信封 JSON —— 客户端以"是否收到 [DONE]"判完成,
+      以 error 帧的 code 判异常类别;账本同步记 502 类,不静默记 200。
+    """
+    body = GatewayErrorBody.model_validate(
+        {"error": {"message": message, "type": "bad_gateway", "code": code,
+                   "request_id": current_request_id()}}
+    )
+    return (
+        b"event: error\ndata: "
+        + json.dumps(body.model_dump(), ensure_ascii=False).encode()
+        + b"\n\n"
+    )
+
+
 def _record_metrics(
     auth: AuthResult | None,
     model: str,
@@ -569,6 +589,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 ):
                     acc.feed(chunk)  # 旁观解析 usage,不影响透传字节
                     yield chunk
+                if not acc.saw_done:
+                    # GW-9:干净截断探测 —— 上游关流但没发 [DONE]。修复前 relay
+                    # 正常走完、无任何标记,账本静默记 200,客户端把截断当完成。
+                    holder["status"] = 502
+                    logger.warning("upstream_stream_truncated_no_done", channel=channel)
+                    yield _sse_error_frame(
+                        "upstream stream ended without [DONE] (truncated)",
+                        "stream_truncated_no_done",
+                    )
                 holder["completed"] = True
             except asyncio.CancelledError:
                 # 客户端断开:上游可能已产生 token,账本标 499,不伪装成 2xx。
@@ -577,7 +606,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             except READ_ERRORS as exc:
                 holder["status"] = 502
                 logger.warning("upstream_read_error_midstream", error=str(exc))
-                yield b'event: error\ndata: {"message": "upstream read timeout mid-stream"}\n\n'
+                # GW-9:异常帧从自定义 {"message": ...} 改为网关统一错误信封
+                yield _sse_error_frame(
+                    "upstream read error mid-stream", "upstream_read_error_midstream"
+                )
             finally:
                 # GW-5 修复顺序:纯内存赋值必须先于任何 await —— 断开取消经
                 # cancel scope 级联,取消作用域内的首个 await 会再抛 CancelledError,

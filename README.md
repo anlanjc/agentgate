@@ -30,7 +30,7 @@ flowchart LR
 | 3 | **准入单 Lua**:限流桶扣减+TPM 窗口+预算读取一次往返;EVALSHA 化 | Higress [ai-token-ratelimit](https://higress.ai/docs/latest/user/plugins/ai/api-consumer/ai-token-ratelimit) | `test_m1_ratelimit` |
 | 4 | **at-least-once + 幂等 = 效果上不重复**:Streams consumer group/XACK/XCLAIM 崩溃恢复/死信,消费端原子抢占 + `(tenant_id, request_id)` UNIQUE 兜底;outbox 水位补投消除双写空洞 | Dify 用 Celery 是黑盒,ADR-003 自研才讲得透 | `test_m2_streams` |
 | 5 | **故障转移状态机**:429 立即冷却+尊重 Retry-After;5xx 冷却 60s;EMA 延迟优先路由;全渠道冷却 → 503(带 Retry-After) | LiteLLM routing/reliability | `test_m2_failover` |
-| 6 | **流式 fallback 的语义难题**:chunk 已发出不可回滚 → mid-stream 错误以 SSE error 事件如实透传 | LiteLLM reliability 文档记录的同款 caveat | `test_stream_*` |
+| 6 | **流式 fallback 的语义难题**:chunk 已发出不可回滚 → SSE 契约如实标注终态:正常完成以 `data: [DONE]` 结束;mid-stream 异常/上游截断不发 [DONE],最后一帧 `event: error` + 网关统一错误信封(含 request_id/code),账本同步记 502 不静默记 200 | LiteLLM reliability 文档记录的同款 caveat | `test_stream_reliability` |
 | 7 | **账本走自研持久队列**(自吃狗粮):at-least-once + 幂等键,网关崩溃在途账本不丢;渠道注册表持久化,重启不丢 | ADR-004/005;自研队列从演示件变核心通道 | `test_m6_persistence` |
 | 8 | **OTel 分布式追踪**(默认关):span 粒度=每次上游尝试,属性含 channel/model/status;request_id 与 trace_id 桥接 | Kimi 全系 JD 明写 OpenTelemetry | `test_m6_tracing`(InMemory 断言) |
 
