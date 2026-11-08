@@ -7,16 +7,15 @@ Create Date: 2026-11-03
 P2 hardening:租户级 token 预算(NULL=不限)—— key 级预算的兜底,
 堵"一个租户签多把 key 绕过单 key 预算"。
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
-
 revision: str = "c8e51b09d447"
-down_revision: Union[str, None] = "a3d94f1c7b21"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "a3d94f1c7b21"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

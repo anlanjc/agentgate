@@ -8,16 +8,15 @@ GW-8(评审 2.0):webhook_secret 入库走 Fernet 加密(与渠道密钥同纪律
 密文带 `enc:v1:` 前缀,128 字符明文密钥的密文约 243 字符 —— 列宽 128 → 384。
 SQLite 不校验 varchar 长度(aiosqlite 直存),PG 需要 ALTER TYPE。
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
-
 revision: str = "d7e5a9c31b42"
-down_revision: Union[str, None] = "b4c19d2e6f78"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "b4c19d2e6f78"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

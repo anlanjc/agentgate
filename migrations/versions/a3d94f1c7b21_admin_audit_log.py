@@ -7,16 +7,15 @@ Create Date: 2026-11-03
 P2 hardening:管理面审计日志(只追加)——谁在什么时候对什么做了什么。
 detail 只放非敏感摘要;与业务变更同事务写入。
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
 
-
 revision: str = "a3d94f1c7b21"
-down_revision: Union[str, None] = "7c1f4a9b2d10"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "7c1f4a9b2d10"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

@@ -13,7 +13,6 @@ import json
 import socket
 
 import httpx
-import pytest
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -148,11 +147,13 @@ async def _drive_stream_disconnect(
         return {"type": "http.disconnect"}
 
     async def send(message):
-        if message["type"] == "http.response.body":
-            if b'"usage"' in message.get("body", b""):
-                usage_sent.set()
-                if send_raises_oserror:
-                    raise OSError("transport closed by peer")  # spec 2.4 断开形态
+        if (
+            message["type"] == "http.response.body"
+            and b'"usage"' in message.get("body", b"")
+        ):
+            usage_sent.set()
+            if send_raises_oserror:
+                raise OSError("transport closed by peer")  # spec 2.4 断开形态
 
     try:
         app_task = asyncio.get_running_loop().create_task(app(scope, receive, send))

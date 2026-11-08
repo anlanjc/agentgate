@@ -160,7 +160,6 @@ async def test_webhook_secret_encrypted_at_rest_and_payload_clean(auth_gateway):
     """GW-8 回归:管理端写入的 webhook_secret 落库即密文(enc:v1:);
     webhook_callback 的任务 payload 只带 tenant_id —— 明文/密文都不进
     task_records.payload 与 Redis 流(修复前明文随 payload 落 Redis+AOF+账本)。"""
-    from sqlalchemy import select
 
     from app.db.models import TaskRecord, Tenant
     from app.security import crypto
@@ -233,11 +232,11 @@ async def test_webhook_delivery_decrypts_stored_secret(auth_gateway):
     import hashlib
     import hmac as hmac_mod
 
-    from sqlalchemy import select, update
+    from sqlalchemy import update
 
     from app.db.models import TaskRecord, Tenant
     from app.security import crypto
-    from app.security.crypto import init_cipher, encrypt_secret
+    from app.security.crypto import encrypt_secret, init_cipher
 
     client, app, mock, raw = auth_gateway
     secret = "whsec-gw8-e2e-0123456789"
