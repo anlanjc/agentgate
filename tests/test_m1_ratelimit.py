@@ -148,3 +148,19 @@ async def test_redis_down_auth_degrades_to_db(auth_gateway):
     app.state.redis = _AuthCacheDeadRedis(app.state.redis)
     r = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
     assert r.status_code == 200
+
+
+async def test_eval_cached_falls_back_after_script_flush(real_redis):
+    """redis 重启/SCRIPT FLUSH 后 EVALSHA 报 No matching script——eval_cached 必须回退 EVAL 重载。
+
+    混沌矩阵 2026-11-09 实测发现:旧判定只匹配字面 NOSCRIPT,而 redis-py 的
+    ResponseError message 是 "No matching script. Please use EVAL."(不含 NOSCRIPT 字样),
+    导致恢复后准入/配额 fail-closed 停摆(混沌 run5 恢复窗 15 次 admission_fail_closed)。
+    """
+    from app.ratelimit.lua import eval_cached
+
+    script = "return redis.call('GET', KEYS[1])"
+    await real_redis.set("lua-k", "v1")
+    assert await eval_cached(real_redis, script, 1, "lua-k") == "v1"
+    await real_redis.script_flush()  # 模拟重启:脚本缓存清空,数据键保留
+    assert await eval_cached(real_redis, script, 1, "lua-k") == "v1"

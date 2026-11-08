@@ -17,7 +17,11 @@ async def eval_cached(redis: aredis.Redis, script: str, numkeys: int, *args):
     try:
         return await redis.evalsha(sha, numkeys, *args)
     except Exception as exc:
-        if "NOSCRIPT" in str(exc):  # Redis 重启/SCRIPT FLUSH 后 SHA 失效
+        # Redis 重启/SCRIPT FLUSH 后 SHA 失效。注意:redis-py 的 ResponseError message 是
+        # "No matching script. Please use EVAL.",错误码 NOSCRIPT 不在 message 里——
+        # 只匹配字面 NOSCRIPT 会漏判(混沌矩阵 2026-11-09 实测:恢复后准入/配额停摆)。
+        msg = str(exc)
+        if "NOSCRIPT" in msg or "No matching script" in msg:
             sha = await redis.script_load(script)
             _SHA_CACHE[script] = sha
             return await redis.evalsha(sha, numkeys, *args)
