@@ -7,6 +7,11 @@ Create Date: 2026-11-09
 GW-8(评审 2.0):webhook_secret 入库走 Fernet 加密(与渠道密钥同纪律)。
 密文带 `enc:v1:` 前缀,128 字符明文密钥的密文约 243 字符 —— 列宽 128 → 384。
 SQLite 不校验 varchar 长度(aiosqlite 直存),PG 需要 ALTER TYPE。
+
+GW-15(评审 3.0):SQLite 不支持 ALTER COLUMN,裸 alter_column 在 SQLite 方言下
+直接 NotImplementedError(此前 CI 只在 PG 上验迁移,SQLite 口径走 create_all
+从不执行迁移 —— 双数据库叙事在迁移链上只成立一半)。改用 batch_alter_table:
+PG 上原样 ALTER(无额外开销),SQLite 上走 create/copy/drop 重建表,双方言安全。
 """
 from collections.abc import Sequence
 
@@ -20,15 +25,17 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.alter_column(
-        "tenants", "webhook_secret",
-        existing_type=sa.String(length=128), type_=sa.String(length=384),
-    )
+    with op.batch_alter_table("tenants") as batch:
+        batch.alter_column(
+            "webhook_secret",
+            existing_type=sa.String(length=128), type_=sa.String(length=384),
+        )
 
 
 def downgrade() -> None:
     # 回滚有截断风险:仅当存量行都是旧明文(≤128)时安全;密文行需先解密回来。
-    op.alter_column(
-        "tenants", "webhook_secret",
-        existing_type=sa.String(length=384), type_=sa.String(length=128),
-    )
+    with op.batch_alter_table("tenants") as batch:
+        batch.alter_column(
+            "webhook_secret",
+            existing_type=sa.String(length=384), type_=sa.String(length=128),
+        )
