@@ -26,7 +26,8 @@ def main() -> None:
 
     # 幂等:pytest 的 create_all 可能已建表,先清掉再走迁移
     db.psql(
-        "DROP TABLE IF EXISTS usage_records, task_records, virtual_keys, channels, tenants CASCADE;"
+        "DROP TABLE IF EXISTS usage_records, task_records, virtual_keys, channels, tenants,"
+        " audit_logs CASCADE;"  # audit_logs 由迁移链 a3d94f1c7b21 建,漏 drop 会假红(DuplicateTable)
         "DROP TABLE IF EXISTS alembic_version CASCADE;"
     )
 
