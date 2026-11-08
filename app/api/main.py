@@ -196,7 +196,13 @@ def create_app(
         except Exception as e:
             checks["db"] = f"fail: {e}"
             ok = False
-        checks["queue_backlog"] = await app_.state.task_queue.backlog()
+        try:
+            checks["queue_backlog"] = await app_.state.task_queue.backlog()
+        except Exception as e:
+            # redis 断连时 backlog(XLEN) 会抛——必须落入结构化 503 信封而非 500 空体
+            # (混沌/演示车道 2026-11-09 实测发现)。
+            checks["queue_backlog"] = f"fail: {e}"
+            ok = False
         if not ok:
             from starlette.responses import JSONResponse
 

@@ -130,3 +130,31 @@ async def test_ready_endpoint(auth_settings, redis_client):
     assert data["ready"] is True
     assert data["checks"]["redis"] == "ok" and data["checks"]["db"] == "ok"
     await app.state.task_queue.stop()
+
+
+async def test_ready_redis_down_returns_structured_503(auth_settings):
+    """redis 断连时 /ready 必须返回结构化 503 信封而非 500 空体。
+
+    演示车道 2026-11-09 实测发现:queue_backlog(XLEN)未包异常,redis 断连期
+    /ready 变 500 空体,redis/db 检查的结构化 503 永远走不到。
+    """
+    import redis.asyncio as aredis
+
+    dead = aredis.from_url(
+        "redis://127.0.0.1:59999/0", decode_responses=True, protocol=2,
+        socket_connect_timeout=0.5, socket_timeout=0.5,
+    )
+    app = create_app(settings=auth_settings, redis_client=dead)
+    await init_db(app.state.engine)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+    ) as client:
+        r = await client.get("/ready")
+    assert r.status_code == 503
+    data = r.json()
+    assert data["ready"] is False
+    assert data["checks"]["redis"].startswith("fail")
+    assert data["checks"]["queue_backlog"].startswith("fail")
+    assert data["checks"]["db"] == "ok"  # sqlite 不受影响,证明信封双检语义完整
+    await app.state.task_queue.stop()
+    await dead.aclose()
