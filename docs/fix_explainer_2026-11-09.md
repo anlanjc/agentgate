@@ -209,3 +209,66 @@
 - ruff 清理:migrations 模板旧式 typing + 测试残留导入,`ruff check .` 全绿(3afb728)。
 - 测试增长对账:基线 102+2skip → GW-3 +3 → GW-4 +3 → GW-5 +3 → GW-6 +1 → GW-7 +3 → GW-8 +2 → GW-9 +2 → GW-10 +2 → GW-11 原地改造 = **121+2skip**;PG 口径同套件 123(pgvector 2 项在 PG 真跑)。
 - 全程未做真模型调用、未 push、未写 PROGRESS.md、未提交任何真实密钥。
+
+---
+
+# 评审 3.0 修复讲解手册(GW-13 ~ GW-16)——"修复引入新问题"批
+
+> 评审 3.0(`review_report_3.md` §2.1)对本日修复批的对抗复查:两条是修复引入的新问题(GW-13/15),两条是残余与口径(GW-14/16)。commit:0173ba1 / 0dd8cb4 / bb9803a / d56c4b8 / f78c08e。
+> 终态口径(2026-11-09 实跑):SQLite **130 passed + 2 skipped** / PG **132 passed** / ruff 全绿 / 迁移双方言验证。
+
+## GW-13 [DONE] 探测只认规范间距(0173ba1 ｜ GW-9 引入)
+
+**现象/危害**:上游以 `data:[DONE]`(无空格,SSE 规范合法)收尾**完整**流——网关字节原样透传(客户端无感),但账本把正常请求记 502、补发多余 error 帧、监控告警"截断"。
+
+**根因**:`app/upstream/sse.py` 的 `SSELineParser.feed`(修复版 :68-70):GW-9 加的探测在**整行 strip 后与 `b"data: [DONE]"` 全等比较**,才走到 body 归一化。无空格变体全等不中 → `saw_done` 不置位 → body 归一化后恰为 `b"[DONE]"` → 被 json 解析静默吞掉——**同一份 body 两条路,判定缝隙恰在两路之间**。讽刺点:修复前的旧代码(`body == b"[DONE]"`)对间距是宽容的,修复时把判定提前"优化"出了回归。
+
+**修法**:判定挪回 body 归一化之后——`data:` 前缀剥离 + strip 后与 `b"[DONE]"`(常量语义改为字段值形态)全等,再进 json 解析。一行结构的调整,消灭"归一化后恰是终止标记却被当下一个 json 解析"的缝。否掉的替代:`stripped.replace(b"data:", b"", 1)` 原地改写——等价但绕,归一化本来就 得做一次。
+
+**回归**:`test_sse_parser_done_marker_variants`(5 种合法变体 + 3 个负例:JSON 内含 [DONE] 字样、带后缀伪终止、非 data 行)、`test_sse_parser_done_across_chunk_boundary`(跨 TCP 分段)、`test_stream_nonstandard_done_marker_not_truncated`(真上游无空格收尾 → 200、无 error 帧、账本不误记 502)。
+
+**面试 30 秒**:这是我自己的修复引入的回归——重写解析器时把 [DONE] 判定从"归一化后比较"提前成了"整行与规范字面量全等",而 SSE 规范只约束字段语义不约束冒号后的空格。自建网关渠道是网关的核心卖点,代理链完全可能改写间距。教训:**判定必须和归一化共用同一份中间结果**,不能并行写两套匹配逻辑——缝隙就长在两套逻辑的差集里。
+
+**关联八股**:SSE 字段语法(field name: value,冒号后空格是惯例不是规范);解析器的归一化层设计(先归一后判定,判定不复述原始格式)。
+
+## GW-14 锁 TTL 与渠道超时的不变量只有注释(0dd8cb4 ｜ GW-3 残余)
+
+**现象/危害**:admin 注册 `read_timeout=600` 的渠道完全合法——幂等锁 300s 先死,t>300s 重试 SETNX 成功与首请求并发执行,GW-3 原始双计费病灶借道重现。另:缺省 TTL=300 与默认读超时 300 **恰好相等零余量**——执行满 300s 的请求收尾时锁刚过期,compare-and-delete 返回 False,成功响应放弃进重放库。
+
+**根因**:GW-3 修了锁的**机制**(属主/交叉释放/接管后 store 权),但"TTL ≥ 合法执行期"这个**前提**只写在 config 注释里——注释会过期,校验不会。评审 3.0 的定性一针见血:属主 token 防得住"删别人的锁/覆盖 store",防不住**双执行本身**。
+
+**修法**(三处硬闸,师承本仓 GW-7 的 `:?强制` 正面示范):①缺省 300→450(1.5x 余量);②`Settings._validate_lock_covers_read_timeout` 启动校验器(所有环境,TTL < 读超时直接拒启);③admin 渠道注册端点 `_validate_read_timeout_vs_lock_ttl`——超 TTL 回 400(code=`read_timeout_exceeds_idem_ttl`,错误信息给出两个解法);④存量行(注册闸之前入库的长超时渠道)启动恢复时 `logger.warning` 留痕不拦截——渠道可用性优先,但必须可审计。否掉的替代:锁 TTL 动态跟随各渠道超时(每租户每渠道一把不同 TTL 的锁)——把一个全局配置变成分布式状态,TTL 管理复杂度不值。
+
+**回归**:`test_settings_rejects_lock_ttl_below_read_timeout`(启动拒 + 正常组合放行)、`test_register_channel_rejects_read_timeout_over_lock_ttl`(600→400+code、450 边界=上限放行、未注册)。
+
+**面试 30 秒**:评审抓了个漂亮的残余:我修好了锁的属主机制,但"锁必须活过执行期"这个前提还躺在注释里——注册一个 600 秒超时的渠道,原始双计费场景原样重现。修法是把不变量从注释挪进校验:配置校验器管默认渠道(启动 fail-closed),注册端点管自建渠道(400),存量行警告留痕。原则:**注释是文档,校验才是守卫**。
+
+**关联八股**:不变量的落点(类型系统/校验器/测试 vs 注释);配置联动校验(startup-time invariant checking);防御纵深(同一不变量三道闸各管一个入口)。
+
+## GW-15 迁移对 SQLite 方言必炸(bb9803a ｜ GW-8 引入)
+
+**现象/危害**:默认 `db_url=sqlite+aiosqlite` 下 `alembic upgrade head` → 升到 d7e5a9c31b42 即 NotImplementedError——迁移链断头。CI 只在 PG 服务上验迁移,SQLite 口径走 create_all 从不执行迁移:**本仓没有任何一条路径验证过 SQLite 方言的迁移链**,而"双数据库方言"正是本仓主打的差异化叙事。
+
+**根因**:GW-8 迁移用裸 `op.alter_column(type_=...)`——SQLite 不支持 ALTER COLUMN,alembic 非 batch 模式直接抛 NotImplementedError。docstring 甚至自己写了"SQLite 不校验 varchar 长度,PG 需要 ALTER TYPE",代码却没按这个认知分支——认知与实现脱节。
+
+**修法**:`batch_alter_table` 包裹(评审给的三个选项里最外科的一个)——PG 上原样 ALTER 零额外开销,SQLite 上走 create/copy/drop 重建表;upgrade/downgrade 都包。并**补上缺失的验证路径**:`tests/test_migrations_sqlite.py` 两条同步测试(alembic env.py 自带 asyncio.run,不可包在运行中的事件循环里)——临时 SQLite 上编程式 upgrade head、PRAGMA 钉列宽产物、幂等重跑、downgrade 往返。红验证:stash 掉 batch 修复,两条测试以 NotImplementedError 失败。
+
+**回归**:`test_sqlite_migration_chain_upgrades_head`(全链 head + 表集 + VARCHAR(384) 产物 + 版本号 + 幂等)、`test_sqlite_migration_downgrade_roundtrip`(可逆性)。
+
+**面试 30 秒**:又一个自己的修复引入的问题:给 webhook_secret 加密的迁移用了裸 alter_column,PG 上没问题,SQLite 方言下 alembic 直接 NotImplementedError——而 CI 只验 PG,SQLite 走 create_all 从不碰迁移,等于迁移链在"双数据库"叙事的一半上从未被验证过。修法是 batch_alter_table(PG 等价 ALTER,SQLite 走表重建),并补一条 SQLite 全链真跑回归把这条路永久钉住。教训:**支持两种方言,就要在两种方言上验证同一个代码路径**。
+
+**关联八股**:SQLite 的 ALTER TABLE 限制与 alembic batch 模式(copy-table 语义);迁移的方言可移植性(项目红线"只用通用类型"的迁移侧延伸);CI 覆盖盲区(测试口径 ≠ 部署路径)。
+
+## GW-16 "统一口径"自身仍互斥(f78c08e ｜ GW-12 引入)
+
+**现象/危害**:README "121+2skip" 与混沌证据 "123+2skip" 同日互斥——两处都自称"实跑口径"。
+
+**根因(比报告的静态推断再多一层)**:静态计数(132 定义)支持 123+2,而 README 的 121 是 GW-12 时点的真数——**树在两车道之间移动**:GW-12 提交后混沌车道又加了 2 条回归(NOGROUP/NOSCRIPT),两份文档各自在各自时点诚实,合起来就是互斥。根因仍是 GW-12 的老病:**没有单一出处 + 数字随树漂移**。
+
+**修法**:①终态重测——GW-13/14/15 的回归入列后两方言全量重跑(SQLite 130+2 / PG 132),README badge/验收节/项目书/PITCH/RESUME/EVIDENCE 终态节全部刷到实数;②chaos 矩阵的历史数字保留但标注"本批当时口径,唯一出处见 EVIDENCE 终态节";③期间排查还揪出一个**测试基建真 bug**(d56c4b8):GW-5 断开回归用的 `loop.shutdown_asyncgens()` 会把 pytest-asyncio 挂起中的 fixture 异步生成器一并 aclose——PG 口径下 `_pg_clean` 的 TRUNCATE 被静默跳过,测试间主键冲突(SQLite 无此 fixture 故全绿掩盖)。改为 `sys.set_asyncgen_hooks` firstiter 定向捕获 relay、测后单独 aclose。
+
+**回归**:GW-16 本身是文档批,守护手段=单一出处(EVIDENCE 终态节)+ grep 全扫;顺带产出的 d56c4b8 让 GW-5 的两口径回归在 PG 全量下首次稳定(此前 PG 口径必挂)。
+
+**面试 30 秒**:我"统一口径"的 commit 自己就和混沌证据互斥——两份文档各自诚实,合起来撒谎,因为测试树在两个会话之间移动。修复是三层:终态重测取实数(130+2/132)、历史快照标注时点并把唯一出处收敛到 EVIDENCE、顺手挖出一个被 SQLite 全绿掩盖的测试基建真 bug(shutdown_asyncgens 杀 fixture 清理)。这轮的元教训:**在多人并行的树上,"以实跑为准"必须绑定"跑在当前树上"+单一出处**。
+
+**关联八股**:文档数字的单一出处与漂移防护;测试间状态泄漏(fixture teardown 的完整性);asyncio asyncgen 生命周期(firstiter/finalizer 钩子、shutdown_asyncgens 的作用域)。
