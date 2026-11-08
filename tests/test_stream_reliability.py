@@ -100,6 +100,17 @@ async def _make_gateway_app(auth_settings, redis_client, port: int):
     return app, raw, upstream
 
 
+async def _finalize_abandoned_generators() -> None:
+    """GW-5 spec2.4 场景的确定性收尾:被弃的 relay 生成器悬在 yield 点,
+    GeneratorExit 收尾(含显式记账)依赖 asyncgen finalizer —— 不赌 GC 时序,
+    直接 shutdown_asyncgens 同步驱动(loop 内其余生成器均已自然耗尽,无副作用)。"""
+    await asyncio.get_running_loop().shutdown_asyncgens()
+    import gc
+
+    gc.collect()  # 兜底:清掉残余引用,防 "Task exception was never retrieved" 噪声
+    await asyncio.sleep(0.01)
+
+
 async def _poll_ledger_rows(app) -> list:
     rows: list = []
     for _ in range(300):
@@ -107,9 +118,7 @@ async def _poll_ledger_rows(app) -> list:
             rows = (await db.execute(select(UsageRecord))).scalars().all()
         if rows:
             break
-        import gc
-
-        gc.collect()  # spec 2.4:生成器由 asyncgen finalizer 收尾,给 GC 触发点
+        await _finalize_abandoned_generators()
         await asyncio.sleep(0.02)
     return rows
 
@@ -180,6 +189,7 @@ async def _drive_stream_disconnect(
         else:
             assert outcome["end"] == "normal"  # spec 2.3:取消在任务组内消化
 
+        await _finalize_abandoned_generators()  # spec 2.4:确定性驱动 GeneratorExit 收尾
         rows = await _poll_ledger_rows(app)
         assert len(rows) == 1, f"账本应恰好一行,实际 {len(rows)}"
         row = rows[0]
@@ -311,3 +321,105 @@ async def test_sse_error_frame_shape_is_gateway_envelope():
     assert payload["error"]["type"] == "bad_gateway"
     assert payload["error"]["code"] == "upstream_read_error_midstream"
     assert "request_id" in payload["error"]
+
+
+# ---------- GW-13(评审 3.0)回归:[DONE] 判定兼容 SSE 规范允许的间距变体 ----------
+
+
+def test_sse_parser_done_marker_variants():
+    """GW-13 单元回归:[DONE] 判定在 body 归一化之后做 —— `data:[DONE]`(无空格)
+    等合法 SSE 变体必须置位 saw_done(修复版整行全等比较会把它们漏成 json 静默失败,
+    完整流被误判干净截断,账本记 502)。"""
+    from app.upstream.sse import SSELineParser
+
+    for raw in (
+        b"data: [DONE]\n\n",   # 规范间距
+        b"data:[DONE]\n\n",    # 无空格(规范允许)
+        b"data:  [DONE]\n\n",  # 多空格(strip 归一)
+        b"data:[DONE]\r\n",    # CRLF 行尾(SSE 规范允许)
+        b"data: [DONE]\r\r\n", # 混合尾随空白
+    ):
+        p = SSELineParser()
+        assert p.feed(raw) == []
+        assert p.saw_done is True, f"变体 {raw!r} 应识别为 [DONE]"
+
+    # 负例:JSON 里含 "[DONE]" 字样 / 带后缀的伪终止 / 非 data 行,不置位
+    p = SSELineParser()
+    p.feed(b'data: {"text": "[DONE]"}\n\n')
+    assert p.saw_done is False
+    p2 = SSELineParser()
+    p2.feed(b"data: [DONE]extra\n\n")
+    assert p2.saw_done is False
+    p3 = SSELineParser()
+    p3.feed(b"event: [DONE]\n\n")
+    assert p3.saw_done is False
+
+
+def test_sse_parser_done_across_chunk_boundary():
+    """[DONE] 跨 TCP 分段:解析器缓冲语义不因 GW-13 改动回退。"""
+    from app.upstream.sse import SSELineParser
+
+    p = SSELineParser()
+    assert p.feed(b'data: {"a": 1}\ndata:[DO') == [{"a": 1}]
+    assert p.saw_done is False
+    assert p.feed(b"NE]\n\n") == []
+    assert p.saw_done is True
+
+
+async def test_stream_nonstandard_done_marker_not_truncated(auth_settings, redis_client):
+    """GW-13 集成回归:上游以 `data:[DONE]`(无空格)收尾完整流 —— 修复前
+    saw_done 不置位,relay 补发 error 帧且账本误记 502;修复后如实 200,
+    转发字节零改动(客户端收到的就是上游原样)。"""
+    from app.api.main import create_app
+    from app.db.models import UsageRecord
+    from app.upstream.client import UpstreamClient
+
+    async def gen():
+        yield b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n'
+        yield b"data:[DONE]\n\n"  # 非规范间距(规范合法)
+
+    upstream_app = FastAPI()
+
+    @upstream_app.post("/v1/chat/completions")
+    async def chat(request: Request):
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    upstream = UpstreamClient(
+        auth_settings.upstream_base_url, auth_settings.upstream_api_key,
+        client=httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=upstream_app),
+            base_url=auth_settings.upstream_base_url,
+        ),
+    )
+    app = create_app(settings=auth_settings, upstream=upstream, redis_client=redis_client)
+    await init_db(app.state.engine)
+    raw, key_hash, prefix = generate_key()
+    async with app.state.session_factory() as db:
+        db.add(Tenant(id="t-gw13", name="gw13"))
+        db.add(VirtualKey(id="k-gw13", tenant_id="t-gw13", key_hash=key_hash, key_prefix=prefix,
+                          rpm_limit=10_000, tpm_limit=10_000_000))
+        await db.commit()
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gw"
+        ) as client:
+            r = await client.post(
+                "/v1/chat/completions",
+                json={"model": "mock-model", "messages": [{"role": "user", "content": "hi"}],
+                      "stream": True},
+                headers={"Authorization": f"Bearer {raw}"},
+            )
+        assert r.status_code == 200
+        assert b"data:[DONE]" in r.content  # 透传零改动
+        assert b"event: error" not in r.content  # 完整流不补发 error 帧
+        await app.state.task_queue.flush()
+        async with app.state.session_factory() as db:
+            from sqlalchemy import select
+
+            rows = (await db.execute(select(UsageRecord))).scalars().all()
+        assert len(rows) == 1 and rows[0].status == 200  # 不误记 502
+    finally:
+        await app.state.task_queue.stop()
+        await upstream.aclose()
+        await app.state.engine.dispose()

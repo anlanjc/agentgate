@@ -10,7 +10,9 @@
 
 from collections.abc import AsyncIterator
 
-DONE_MARKER = b"data: [DONE]"
+# [DONE] 终止标记的字段值形态(GW-13):判定发生在 body 归一化之后,
+# 因此这里只存字段值 —— 前缀与间距由解析器统一归一化。
+DONE_MARKER = b"[DONE]"
 
 
 class FirstDataEventDetector:
@@ -44,6 +46,9 @@ class SSELineParser:
     纪律:解析器与转发器解耦 —— 转发仍走原始字节(零改动),解析只旁观副本。
     saw_done(GW-9):是否见过 [DONE] 终止标记 —— 流正常结束的判据;干净截断
     (上游关流但没发 [DONE])据此补发 error 帧并改账本口径,不再静默记 200。
+    saw_done(GW-13):判定必须放在 body 归一化之后 —— SSE 规范只约束字段语义,
+    冒号后的空格可有可无(`data:[DONE]` 与 `data: [DONE]` 等价)。修复版曾在
+    整行 strip 后与规范字面量全等比较,合法无空格变体会让完整流被误判截断。
     """
 
     def __init__(self, max_buffer: int = 262_144) -> None:
@@ -65,11 +70,14 @@ class SSELineParser:
             stripped = line.strip()
             if not stripped.startswith(b"data:"):
                 continue
-            if stripped == DONE_MARKER:
-                self.saw_done = True
-                continue
+            # GW-13:先归一化字段值(剥 "data:" 前缀 + strip,兼容任意合法间距),
+            # 再做 [DONE] 全等 —— 与 json 解析用同一份 body,不会出现"归一化后
+            # 恰为 [DONE] 却被 json 静默吞掉"的判定缝隙。
             body = stripped[len(b"data:"):].strip()
             if not body:
+                continue
+            if body == DONE_MARKER:
+                self.saw_done = True
                 continue
             try:
                 import json
