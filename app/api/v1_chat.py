@@ -30,7 +30,7 @@ from app.quota import service as quota_service
 from app.ratelimit.admit import AdmitResult, admit
 from app.router.failover import ChannelRouter
 from app.schemas.openai import ChatCompletionRequest, GatewayErrorBody
-from app.upstream.client import READ_ERRORS, UPSTREAM_TRANSPORT_ERRORS
+from app.upstream.client import READ_ERRORS, ROUTE_ERRORS
 from app.upstream.sse import UsageAccumulator, relay_stream
 
 router = APIRouter(prefix="/v1")
@@ -60,9 +60,12 @@ def _retry_after_s(resp: httpx.Response) -> int:
 
 
 def _classify_upstream_exc(exc: Exception) -> tuple[int, str, str]:
-    """传输异常 → (状态码, message, code)。真超时=504;对端中断/连不上=502。"""
+    """传输异常 → (状态码, message, code)。真超时=504;对端中断/连不上=502;
+    坏 URL(GW-10)=502 bad_gateway 类,必须走统一信封而不是裸 500。"""
     if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout)):
         return 504, "upstream timeout", "upstream_timeout"
+    if isinstance(exc, (httpx.InvalidURL, httpx.UnsupportedProtocol)):
+        return 502, "upstream url invalid", "upstream_invalid_url"
     return 502, "upstream unreachable", "upstream_connect_failed"
 
 
@@ -104,7 +107,7 @@ async def _dispatch_non_stream(
                 )
                 if span:
                     span.set_attribute("http.status_code", resp.status_code)
-        except UPSTREAM_TRANSPORT_ERRORS as exc:
+        except ROUTE_ERRORS as exc:
             await r.mark_failure(name)
             last_exc = exc
             continue
@@ -162,7 +165,7 @@ async def _dispatch_stream(
                 )
                 if span:
                     span.set_attribute("http.status_code", resp.status_code)
-        except UPSTREAM_TRANSPORT_ERRORS as exc:
+        except ROUTE_ERRORS as exc:
             await r.mark_failure(name)
             last_exc = exc
             continue
@@ -540,7 +543,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
             channel, resp, opened = await _dispatch_stream(
                 state, payload, forward_headers, trace_ctx, captured
             )
-        except UPSTREAM_TRANSPORT_ERRORS as exc:
+        except ROUTE_ERRORS as exc:
             status, message, code = _classify_upstream_exc(exc)
             logger.warning("upstream_transport_error", error=str(exc), status=status)
             await _enqueue_error(state, auth, req.model, request_id, status)
@@ -870,7 +873,7 @@ async def _non_stream_core(
         channel, resp = await _dispatch_non_stream(
             state, payload, forward_headers, trace_ctx, captured
         )
-    except UPSTREAM_TRANSPORT_ERRORS as exc:
+    except ROUTE_ERRORS as exc:
         if sf_acquired:
             await response_cache.release(state.redis, rkey)
         status, message, code = _classify_upstream_exc(exc)

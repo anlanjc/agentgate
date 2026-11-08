@@ -19,6 +19,12 @@ logger = get_logger("upstream")
 CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ReadError, httpx.WriteError)
 READ_ERRORS = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
 UPSTREAM_TRANSPORT_ERRORS = CONNECT_ERRORS + READ_ERRORS
+# GW-10:坏 base_url(scheme/host 非法)在发送时才抛,且不在传输异常面内 ——
+# 漏接会成为未处理 500,mark_failure 从未执行,渠道不冷却、故障转移被绕过。
+# 注册端点已挡新坏 URL(admin 400),这里兜住存量坏行/手工配置的运行时路径。
+UPSTREAM_URL_ERRORS = (httpx.InvalidURL, httpx.UnsupportedProtocol)
+# 调度层统一捕获面 = 传输异常 + URL 异常(→ mark_failure → failover/502)
+ROUTE_ERRORS = UPSTREAM_TRANSPORT_ERRORS + UPSTREAM_URL_ERRORS
 
 
 def _build_headers(api_key: str) -> dict:

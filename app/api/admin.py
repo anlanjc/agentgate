@@ -325,6 +325,25 @@ class ChannelCreate(BaseModel):
     read_timeout: float = 120.0
 
 
+def _validate_base_url(base_url: str) -> None:
+    """GW-10:base_url 注册时校验 scheme/host,坏 URL 回 400 而非注册成功。
+
+    修复前裸 str 直接入库注册成功;坏 URL 的异常(httpx.UnsupportedProtocol/
+    InvalidURL)在发送时才抛且不在捕获面内 → 未处理 500,mark_failure 从未
+    执行,渠道不冷却持续留在候选 —— 健康备渠永不接管,故障转移契约失效。
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise GatewayError(
+            400,
+            f"invalid channel base_url '{base_url}': must be an http(s) URL with a host",
+            "invalid_request_error",
+            "invalid_base_url",
+        )
+
+
 @router.post("/channels")
 async def register_channel(body: ChannelCreate, request: Request) -> dict:
     """把任意 OpenAI 兼容服务注册为网关渠道(含自家 Agent 应用),无需重启。
@@ -333,6 +352,7 @@ async def register_channel(body: ChannelCreate, request: Request) -> dict:
     进程内测试请直接调 ChannelRouter.register(不走本端点)。
     """
     _require_admin(request)
+    _validate_base_url(body.base_url)
 
     import uuid as _uuid
 
