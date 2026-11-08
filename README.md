@@ -61,6 +61,7 @@ TTFT/总延迟/渠道/缓存命中四指标实测显示、request_id 徽章、�
 | 帧 | 看什么 | 缩略图 |
 |---|---|---|
 | Playground SSE 实答 | 逐字输出 + TTFT/总延迟/渠道/缓存四指标 + request_id 徽章(44ms/59ms 实测) | <img src="docs/screenshots/playground_stream.png" width="420"> |
+| Playground 缓存对照 | 非流式同题重发:历史轨迹 MISS 57ms → HIT 31ms,命中渠道切为 cache | <img src="docs/screenshots/playground_cache_hit.png" width="420"> |
 
 ## 快速开始
 
