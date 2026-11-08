@@ -409,6 +409,11 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
     """
     state = request.app.state
     record = record_or_factory() if callable(record_or_factory) else record_or_factory
+    if record is None:
+        # GW-5:断开路径已由 relay 收尾显式记账(holder.accounted 单向闸)。
+        # spec<2.4 服务器(uvicorn 0.54)断开后仍会执行 background —— 这里必须
+        # 让位,否则账本/预算/指标双计;spec≥2.4 断开后 background 不跑,无此问题。
+        return
     from app.queue.streams import TaskQueue
 
     tq: TaskQueue = state.task_queue
@@ -543,7 +548,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 background=BackgroundTask(_account, request, auth, record),
             )
 
-        holder: dict = {"usage": None, "ttft_ms": None, "status": 200, "latency_ms": 0}
+        # GW-5:completed=生成器自然跑完;accounted=已显式记账(防 background 双计)
+        holder: dict = {
+            "usage": None, "ttft_ms": None, "status": 200, "latency_ms": 0,
+            "completed": False, "accounted": False,
+        }
 
         async def relay() -> AsyncIterator[bytes]:
             acc = UsageAccumulator()
@@ -559,6 +568,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 ):
                     acc.feed(chunk)  # 旁观解析 usage,不影响透传字节
                     yield chunk
+                holder["completed"] = True
             except asyncio.CancelledError:
                 # 客户端断开:上游可能已产生 token,账本标 499,不伪装成 2xx。
                 holder["status"] = 499
@@ -568,7 +578,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                 logger.warning("upstream_read_error_midstream", error=str(exc))
                 yield b'event: error\ndata: {"message": "upstream read timeout mid-stream"}\n\n'
             finally:
-                await resp.aclose()
+                # GW-5 修复顺序:纯内存赋值必须先于任何 await —— 断开取消经
+                # cancel scope 级联,取消作用域内的首个 await 会再抛 CancelledError,
+                # 排在其后的赋值/指标永远执行不到(断开即漏计的根因)。
+                if not holder["completed"] and holder["status"] == 200:
+                    # 生成器被中途终止但没走 CancelledError 分支(spec≥2.4 服务器:
+                    # 下游 send 失败 → OSError → 生成器被 GC/GeneratorExit 收尾),
+                    # 客户端已断开 —— 按 499 口径记账,不伪装成 200。
+                    holder["status"] = 499
                 holder["usage"] = acc.usage
                 holder["latency_ms"] = int((time.perf_counter() - request_t0) * 1000)
                 # 指标必须在流真正结束后记:此前在构造 StreamResponse 时记,
@@ -586,8 +603,38 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
                     duration_ms=holder["latency_ms"],
                     status=holder["status"],
                 )
+                # 关闭上游连接:shield 包裹 —— 取消作用域内普通 await 会再抛
+                # CancelledError,close 会被打断;shield 让 close 在独立任务里跑完。
+                try:
+                    await asyncio.shield(resp.aclose())
+                except asyncio.CancelledError:
+                    pass  # close 已移交 shield 任务继续,取消由外层 except 分支再抛
+                except Exception as exc:
+                    logger.warning("upstream_stream_close_failed", error=str(exc))
+                # GW-5:记账不依赖 background —— spec≥2.4 服务器断开后 background
+                # 整个不跑(连账本行与并发槽释放都没有)。生成器未自然跑完即客户端
+                # 已断开:relay 收尾显式记账;background 若仍执行(spec<2.4)由
+                # accounted 闸让位,防止双计费。注意这里直接构造 record(不过
+                # make_record 的 accounted 闸 —— 那是给 background 的让位闸)。
+                if not holder["completed"] and not holder["accounted"]:
+                    holder["accounted"] = True
+                    explicit_record = _record(
+                        auth, req.model, request_id, holder["status"],
+                        holder["usage"], holder["ttft_ms"], holder["latency_ms"],
+                        channel=channel or "",
+                    )
+                    try:
+                        await asyncio.shield(_account(request, auth, explicit_record))
+                    except asyncio.CancelledError:
+                        # 取消作用域内让位:记账已移交 shield 任务继续跑完
+                        logger.info("stream_accounting_delegated", status=holder["status"])
+                    except Exception as exc:
+                        logger.warning("stream_accounting_failed", error=str(exc))
 
-        def make_record() -> dict:
+        def make_record() -> dict | None:
+            if holder["accounted"]:
+                # GW-5:relay 收尾已显式记账,background 让位(防双计费)
+                return None
             return _record(
                 auth, req.model, request_id, holder["status"],
                 holder["usage"], holder["ttft_ms"], holder["latency_ms"],
