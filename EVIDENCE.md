@@ -181,12 +181,12 @@
 - **P4-3 K8s 清单**(deploy/k8s):Deployment(2 副本双探针非 root)/Service/HPA(2~10,CPU 70%)/ConfigMap/Secret 模板;有意不含 PG/Redis StatefulSet(托管优先);**未实跑诚实标注**。
 - **P4-4 pgvector 后端**:内嵌 PG 16.2 自带 vector 0.6.2 → 真实现(app/cache/semantic_pg.py):幂等建表+HNSW、KNN 召回、降级当 miss;`semantic_backend=redis|pgvector` 双后端,SQLite 口径诚实 skip。**顺手修 PG 连接池卫生真 bug**:95+ 测试 × 每 app 连接池不释放 → too many clients;fixture teardown 统一 engine.dispose()。
 
-### 终态(2026-11-09,评审 2.0 修复批 GW-3~GW-12 后复测;全库唯一「终态」口径)
+### 终态(2026-11-09,评审 2.0+3.0 修复批 GW-3~GW-16 后复测;全库唯一「终态」口径)
 
-- **SQLite:121 passed + 2 skipped**(pgvector 是 PG 专属口径,skip=诚实标注)
-- **PostgreSQL 16.2:123 passed**(含 pgvector KNN 往返+租户隔离)
+- **SQLite:130 passed + 2 skipped**(pgvector 是 PG 专属口径,skip=诚实标注)
+- **PostgreSQL 16.2:132 passed**(含 pgvector KNN 往返+租户隔离)
 - 历史快照:2026-11-03 为 67×2;2026-11-04 为 95+2skip / 97 —— 测试数随批次增长,以本节为准
-- ruff 全绿;Alembic 迁移链 3215fe6889f5→7c1f4a9b2d10→a3d94f1c7b21→c8e51b09d447→e6f22c81a903→f9a37c2d5b84→b4c19d2e6f78→d7e5a9c31b42 真 PG 验证
+- ruff 全绿;Alembic 迁移链 3215fe6889f5→…→b4c19d2e6f78→d7e5a9c31b42 **双方言验证**(PG 真库脚本 + SQLite 全链真跑回归)
 - 剩余边界:compose/k8s 未实跑(等 Docker/集群;GW-7 已补 compose 主密钥强制+静态回归,容器冒烟待部署日)、AskBI 实接(等跨项目授权)、预算百分比预警、PG 分区
 
 ## ⑩ 收尾自查批次(2026-11-04,AG-2)——"还有没有改进"的答案

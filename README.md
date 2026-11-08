@@ -4,7 +4,7 @@
 > 定位:简历第三层 —— 检索(PolicyCompass)→ 多 Agent(AskBI)→ **平台化(agentgate)**。
 > 设计有据:2026-11 三路实证调研(开源架构 / 30 条 JD 词频 / 面经追问链),每个核心设计标注师承。
 
-[![CI](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml/badge.svg)](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml) [![tests](https://img.shields.io/badge/tests-SQLite%20121%2B2skip%20%2F%20PG%20123-brightgreen)]() [![overhead](https://img.shields.io/badge/c%3D1%20附加开销-3.55ms-blue)]() [![workers](https://img.shields.io/badge/多worker扩展-4.95x-blue)]() [![方言](https://img.shields.io/badge/DB-SQLite%2FPG%20双口径-blue)]()
+[![CI](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml/badge.svg)](https://github.com/anlanjc/agentgate/actions/workflows/ci.yml) [![tests](https://img.shields.io/badge/tests-SQLite%20130%2B2skip%20%2F%20PG%20132-brightgreen)]() [![overhead](https://img.shields.io/badge/c%3D1%20附加开销-3.55ms-blue)]() [![workers](https://img.shields.io/badge/多worker扩展-4.95x-blue)]() [![方言](https://img.shields.io/badge/DB-SQLite%2FPG%20双口径-blue)]()
 
 ## 架构总览
 
@@ -40,8 +40,8 @@ flowchart LR
 - **多进程水平扩展 1.00x → 2.09x → 4.95x**(workers 1/2/4,共享状态全在 Redis)
 - **并发 100 限流扣减恰好放行 50**(容量 50,硬上界零超卖)
 - **并发 100 记账恰好 1800 token**(原子 INCRBY 零丢失)、账本 100 行对账一致
-- **双数据库口径全绿**:121 passed + 2 skipped(SQLite)+ **123 passed(PostgreSQL 16.2)**——pgvector 语义缓存
-  KNN 为 PG 专属口径,SQLite 诚实 skip;Alembic 迁移真 PG 验证(2026-11-09 实跑口径)
+- **双数据库口径全绿**:130 passed + 2 skipped(SQLite)+ **132 passed(PostgreSQL 16.2)**——pgvector 语义缓存
+  KNN 为 PG 专属口径,SQLite 诚实 skip;Alembic 迁移双方言验证(PG 真库 + SQLite 全链真跑);2026-11-09 实跑口径
 - **账本幂等**:`(tenant_id, request_id)` UNIQUE + 消费端原子抢占 + outbox 双向故障注入——
   崩溃重投最多一行,客户端伪造 request_id 不能吞别家账本(幂等键带租户域)
 - **双副本限流一致性实测**:两副本共享 Redis,合并并发 100 × 容量 50 → 恰放行 50(不放大)
@@ -123,7 +123,7 @@ app/
   db/         SQLAlchemy 2.0 方言中立模型 + Alembic
 docs/adr/     ADR-001~007(选型五篇+安全 hardening+语义缓存双后端) · docs/PITCH.md 开场五连应答脚本 · docs/handwrite_cards.md 手撕卡三张
 docs/PROJECT_BOOK.md  面试深挖手册(10 问三段式 + 诚实边界 + 演示剧本)
-tests/        123 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/账本幂等/审计/断开记账/SSE 契约/部署配置/双数据库)
+tests/        132 项(mock 故障注入/真 TCP/真 Redis 集成/MCP 握手/缓存/账本幂等/审计/断开记账/SSE 契约/部署配置/双数据库)
 scripts/      load_test(附加开销口径)· load_workers(扩展曲线)· demo_admin · demo_ecosystem · demo_pc_gateway · smoke_real · verify_pg_migration · agent_shim_example
 deploy/       docker-compose(PG16/Redis7/Prometheus/Grafana/Jaeger + SLO 告警规则)· k8s 清单(Deployment/HPA)
 PRODUCTION_GAP.md  上线前差距清单(A 必做/B 应做/C 锦上添花,同 askbi/PC 纪律)
