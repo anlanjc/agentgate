@@ -424,7 +424,9 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
                 idempotency_key=_idempotency_key("usage", auth, record["request_id"]),
             )
 
-            # webhook 回调(幂等键=租户+request_id):请求完成事件推送给订阅方
+            # webhook 回调(幂等键=租户+request_id):请求完成事件推送给订阅方。
+            # GW-8:payload 只带 tenant_id,webhook_url/secret 由投递方查库解密 ——
+            # 密钥明文(或密文)不再进 Redis 流/AOF 快照与 task_records.payload。
             if auth is not None and record["status"] == 200 and state.settings.auth_enabled:
                 tenant = (
                     await db.execute(select(Tenant).where(Tenant.id == auth.tenant_id))
@@ -434,8 +436,7 @@ async def _account(request: Request, auth: AuthResult | None, record_or_factory)
                         db,
                         "webhook_callback",
                         {
-                            "webhook_url": tenant.webhook_url,
-                            "webhook_secret": tenant.webhook_secret,
+                            "tenant_id": tenant.id,
                             "request_id": record["request_id"],
                             "model": record["model"],
                             "total_tokens": record["total_tokens"],

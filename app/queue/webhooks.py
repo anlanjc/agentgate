@@ -18,7 +18,7 @@ def make_task_handler(session_factory):
 
     async def handler(task_type: str, payload: dict) -> dict:
         if task_type == "webhook_callback":
-            return await deliver_webhook(payload)
+            return await deliver_webhook(payload, session_factory)
         if task_type == "usage_write":
             return await write_usage(payload, session_factory)
         return {"skipped": True, "reason": f"unknown type {task_type}"}
@@ -26,7 +26,34 @@ def make_task_handler(session_factory):
     return handler
 
 
-async def deliver_webhook(payload: dict) -> dict:
+async def _resolve_webhook_target(payload: dict, session_factory) -> tuple[str, str] | None:
+    """GW-8:投递目标(url, 明文 secret)在投递时才查库解密。
+
+    队列 payload 只带 tenant_id(修复前 webhook_secret 明文随 payload XADD 进
+    Redis 流/AOF 快照并永久存 task_records.payload,拖备份即得全部租户验签密钥)。
+    兼容边界:旧格式 payload(webhook_url/webhook_secret 直带)原样支持 ——
+    部署窗口内未消费的历史消息不丢。
+    """
+    if payload.get("tenant_id"):
+        from sqlalchemy import select
+
+        from app.db.models import Tenant
+        from app.security.crypto import decrypt_secret
+
+        async with session_factory() as db:
+            row = await db.execute(select(Tenant).where(Tenant.id == payload["tenant_id"]))
+            tenant = row.scalar_one_or_none()
+        if tenant is None or not tenant.webhook_url:
+            return None
+        return tenant.webhook_url, decrypt_secret(tenant.webhook_secret) if tenant.webhook_secret else ""
+    # 旧格式(部署窗口兼容):payload 自带 url/secret
+    url = payload.get("webhook_url")
+    if not url:
+        return None
+    return url, payload.get("webhook_secret") or ""
+
+
+async def deliver_webhook(payload: dict, session_factory) -> dict:
     """投递回调;租户配了 webhook_secret 时附 HMAC 签名(P4 安全补强)。
 
     验签协议(接收端):
@@ -39,8 +66,12 @@ async def deliver_webhook(payload: dict) -> dict:
     import json as json_mod
     import time as time_mod
 
-    url = payload["webhook_url"]
-    secret = payload.get("webhook_secret")
+    resolved = await _resolve_webhook_target(payload, session_factory)
+    if resolved is None:
+        # 租户已删/未配 url:投递目标不存在,按完成处理(不重试不留死信)
+        return {"skipped": True, "reason": "webhook target missing",
+                "tenant_id": payload.get("tenant_id")}
+    url, secret = resolved
     body = json_mod.dumps(
         {
             "request_id": payload.get("request_id"),
