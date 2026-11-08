@@ -11,6 +11,7 @@ spec_version 分支,httpx.ASGITransport 无法模拟客户端中途断开 ——
 import asyncio
 import json
 import socket
+import sys
 
 import httpx
 import uvicorn
@@ -100,17 +101,6 @@ async def _make_gateway_app(auth_settings, redis_client, port: int):
     return app, raw, upstream
 
 
-async def _finalize_abandoned_generators() -> None:
-    """GW-5 spec2.4 场景的确定性收尾:被弃的 relay 生成器悬在 yield 点,
-    GeneratorExit 收尾(含显式记账)依赖 asyncgen finalizer —— 不赌 GC 时序,
-    直接 shutdown_asyncgens 同步驱动(loop 内其余生成器均已自然耗尽,无副作用)。"""
-    await asyncio.get_running_loop().shutdown_asyncgens()
-    import gc
-
-    gc.collect()  # 兜底:清掉残余引用,防 "Task exception was never retrieved" 噪声
-    await asyncio.sleep(0.01)
-
-
 async def _poll_ledger_rows(app) -> list:
     rows: list = []
     for _ in range(300):
@@ -118,7 +108,6 @@ async def _poll_ledger_rows(app) -> list:
             rows = (await db.execute(select(UsageRecord))).scalars().all()
         if rows:
             break
-        await _finalize_abandoned_generators()
         await asyncio.sleep(0.02)
     return rows
 
@@ -164,6 +153,21 @@ async def _drive_stream_disconnect(
             if send_raises_oserror:
                 raise OSError("transport closed by peer")  # spec 2.4 断开形态
 
+    # 定向捕获 relay 生成器(public API sys.set_asyncgen_hooks):spec 2.4 下它被
+    # starlette 弃在 yield 点,收尾必须显式 aclose(GeneratorExit → finally → 显式记账)。
+    # 不能用 loop.shutdown_asyncgens():那会把 pytest-asyncio 挂起中的 fixture
+    # 异步生成器(_pg_clean/redis_client)一并 aclose,teardown 清理被静默跳过
+    # —— PG 口径下表现为"测试间 TRUNCATE 失效 → 下一测试撞主键"(GW-16 排障实录)。
+    captured: dict = {}
+
+    def _capture_firstiter(agen):
+        frame = getattr(agen, "ag_frame", None)
+        if frame is not None and frame.f_code.co_name == "relay":
+            captured["relay"] = agen
+
+    prev_hooks = sys.get_asyncgen_hooks()
+    sys.set_asyncgen_hooks(firstiter=_capture_firstiter, finalizer=prev_hooks.finalizer)
+
     try:
         app_task = asyncio.get_running_loop().create_task(app(scope, receive, send))
         await asyncio.wait_for(usage_sent.wait(), timeout=5)
@@ -189,7 +193,8 @@ async def _drive_stream_disconnect(
         else:
             assert outcome["end"] == "normal"  # spec 2.3:取消在任务组内消化
 
-        await _finalize_abandoned_generators()  # spec 2.4:确定性驱动 GeneratorExit 收尾
+        # 确定性收尾被弃的 relay(此时已悬在 yield 点,ag_running=False):
+        await captured["relay"].aclose()
         rows = await _poll_ledger_rows(app)
         assert len(rows) == 1, f"账本应恰好一行,实际 {len(rows)}"
         row = rows[0]
@@ -197,6 +202,7 @@ async def _drive_stream_disconnect(
         assert row.total_tokens == 18  # 已产生的 token 不漏计(修复前恒 0/行不存在)
         assert row.ttft_ms is not None  # TTFT 指标随收尾赋值恢复
     finally:
+        sys.set_asyncgen_hooks(firstiter=prev_hooks.firstiter, finalizer=prev_hooks.finalizer)
         from app.queue.streams import TaskQueue
 
         tq: TaskQueue = app.state.task_queue
