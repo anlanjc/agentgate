@@ -64,6 +64,7 @@ TTFT/总延迟/渠道/缓存命中四指标实测显示、request_id 徽章、�
 | Playground 缓存对照 | 非流式同题重发:历史轨迹 MISS 57ms → HIT 31ms,命中渠道切为 cache | <img src="docs/screenshots/playground_cache_hit.png" width="420"> |
 | 管理台渠道健康 | 渠道 EMA 延迟/冷却状态、租户与 virtual key 清单、用量对账、审计流水 | <img src="docs/screenshots/admin_channels.png" width="420"> |
 | 混沌证据 | redis 断连 → 503 admission_unavailable 统一信封(Retry-After 5)→ 重启恢复 200(复刻 chaos C2/C3) | <img src="docs/screenshots/chaos_admission.png" width="420"> |
+| Go 双语言对比 | comparison.md 关键表:裸链路 0.3ms / M1 口径 0.65ms vs Python 全链路 3.55ms 的口径边界 | <img src="docs/screenshots/go_comparison.png" width="420"> |
 
 ## 快速开始
 
