@@ -274,8 +274,17 @@ class TaskQueue:
                     await asyncio.sleep(0.02)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("worker_loop_error")
+            except Exception as exc:
+                if "NOGROUP" in str(exc):
+                    # redis 数据丢失(重启/flush)后 consumer group 随之消失:自愈重建,
+                    # 避免账本消费停摆至应用重启(混沌矩阵 2026-11-09 C3/C4 实测发现)。
+                    logger.warning("worker_group_missing_recreating")
+                    try:
+                        await self.ensure_group()
+                    except Exception:
+                        logger.exception("worker_group_recreate_failed")
+                else:
+                    logger.exception("worker_loop_error")
                 await asyncio.sleep(0.5)
 
     async def _periodic_maintenance(self) -> None:

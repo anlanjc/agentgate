@@ -417,3 +417,30 @@ async def test_lease_timestamp_uses_redis_clock_not_local(queue_env, monkeypatch
     updated = row.updated_at if row.updated_at.tzinfo else row.updated_at.replace(tzinfo=UTC)
     # 若用的是被拨快的本地时钟,偏差会是 120s —— 断言钉住"必须来自 Redis 时钟"
     assert abs(updated - redis_now) < timedelta(seconds=5)
+
+
+async def test_worker_self_heals_after_redis_data_loss(queue_env):
+    """redis 数据丢失(重启/flush)致 consumer group 消失后,worker 自愈重建并继续消费。
+
+    混沌矩阵 2026-11-09 实测发现:修复前 NOGROUP 死循环使账本消费停摆至应用重启。
+    """
+    q, sf, received, redis = queue_env
+    async with sf() as db:
+        await q.enqueue(db, "t", {"x": 1}, idempotency_key="idem-h1")
+    await q.start()
+    for _ in range(200):
+        if q.processed >= 1:
+            break
+        await asyncio.sleep(0.02)
+    assert q.processed == 1
+    # 模拟 redis 重启:数据全丢(stream 与 consumer group 一并消失)
+    await redis.flushdb()
+    # 期间的新投递:XADD 自动建流,但 group 不存在(生产端可用,消费端 NOGROUP)
+    async with sf() as db:
+        await q.enqueue(db, "t", {"x": 2}, idempotency_key="idem-h2")
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while asyncio.get_running_loop().time() < deadline:
+        if q.processed >= 2:
+            break
+        await asyncio.sleep(0.05)
+    assert q.processed >= 2, f"worker 未自愈: processed={q.processed}"
