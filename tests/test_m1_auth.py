@@ -2,11 +2,14 @@
 
 import httpx
 from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.main import create_app
+from app.auth.keys import generate_key
 from app.db.models import VirtualKey
 from app.db.session import init_db
-from tests.conftest import KEY_ID, TENANT_ID, auth_headers
+from tests.conftest import KEY_ID, TENANT_ID, _build_upstream, auth_headers
+from tests.mock_upstream import build_mock_upstream
 
 
 def _body(**extra) -> dict:
@@ -103,3 +106,55 @@ async def test_admin_token_protects(auth_settings, redis_client):
         )
         assert r2.status_code == 200
     await app.state.task_queue.stop()
+
+
+async def test_auth_db_unavailable_503_envelope(auth_settings, redis_client, tmp_path):
+    """PG 故障域混沌(2026-11-11 P1)回归:鉴权存储不可用 = 503 auth_unavailable 信封。
+
+    三分语义第三腿:缓存命中 200 / key 判定无效 401 / 无法判定(存储断连)503。
+    修复前 DB 断连异常穿透全链 → 裸 500(混沌 e2e 在真 uvicorn 上实锤)。
+    """
+    broken = auth_settings.model_copy(update={
+        "db_url": f"sqlite+aiosqlite:///{tmp_path}/no_such_dir/auth.db"})
+    mock_app = build_mock_upstream()
+    upstream = _build_upstream(broken, mock_app)
+    app = create_app(settings=broken, upstream=upstream, redis_client=redis_client)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gw"
+        ) as client:
+            raw, _, _ = generate_key()
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "mock-model", "messages": [{"role": "user", "content": "你好"}]},
+                headers=auth_headers(raw),
+            )
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "auth_unavailable"
+        assert resp.headers.get("retry-after") == "5"
+    finally:
+        await upstream.aclose()
+        await app.state.task_queue.stop()
+        await app.state.engine.dispose()
+
+
+async def test_auth_cache_hit_survives_db_outage(auth_gateway, tmp_path):
+    """PG 故障域混沌(2026-11-11 P2)回归:vk 缓存命中时 DB 断连不穿透鉴权。
+
+    test_cache_first_serves_after_db_row_gone 覆盖"行被删"级;本用例把整个
+    存储层换成连不上的引擎(故障级断连),验证缓存优先语义:命中即零 DB。
+    """
+    client, app, mock, raw = auth_gateway
+    r1 = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
+    assert r1.status_code == 200  # 回填缓存
+
+    broken = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/no_such_dir/auth.db")
+    old_engine, old_factory = app.state.engine, app.state.session_factory
+    app.state.engine = broken
+    app.state.session_factory = async_sessionmaker(broken, expire_on_commit=False)
+    try:
+        r2 = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
+        assert r2.status_code == 200  # 缓存命中,零 DB
+    finally:
+        app.state.engine, app.state.session_factory = old_engine, old_factory
+        await broken.dispose()

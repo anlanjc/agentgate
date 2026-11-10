@@ -19,7 +19,7 @@ from sqlalchemy import select
 from starlette.background import BackgroundTask
 
 from app.auth import keys as auth_keys
-from app.auth.keys import AuthResult, KeyInactive, KeyNotFound
+from app.auth.keys import AuthResult, KeyInactive, KeyNotFound, KeyStoreUnavailable
 from app.cache import response as response_cache
 from app.cache import semantic as semantic_cache
 from app.db.models import Tenant
@@ -229,6 +229,15 @@ async def _authenticate(request: Request, raw_key: str) -> AuthResult:
         raise GatewayError(401, "invalid api key", "authentication_error", "key_not_found")
     except KeyInactive:
         raise GatewayError(401, "api key revoked", "authentication_error", "key_inactive")
+    except KeyStoreUnavailable as exc:
+        # PG 故障域混沌(2026-11-11 P1):鉴权存储不可用 = 无法判定,三分语义的
+        # 第三腿 —— 503 统一信封(与准入 admission_unavailable 同构),不是 401
+        # (判定无效)也不是裸 500(修复前实测)。
+        logger.warning("auth_unavailable", error=str(exc))
+        raise GatewayError(
+            503, "auth store temporarily unavailable", "api_error",
+            "auth_unavailable", retry_after_s=5,
+        )
 
 
 async def _admit(request: Request, auth: AuthResult, model: str) -> AdmitResult:

@@ -20,8 +20,10 @@ logger = get_logger("auth")
 KEY_PREFIX = "ag-"
 CACHE_TTL_SECONDS = 60
 
-# 降级语义:鉴权的事实来源是 PG,Redis 只是快路径 —— 缓存读/写失败都降级为
-# 直查 DB(网关不死);与准入的 fail-closed 相反,准入涉及计费上限,宁可拒不可漏。
+# 降级语义(三分):鉴权的事实来源是 PG,Redis 只是快路径 —— 缓存读/写失败都
+# 降级为直查 DB(网关不死);key 能判定时按事实回 401;PG 也不可用 = "无法判定"
+# (KeyStoreUnavailable → 上层 503 auth_unavailable),与准入的 fail-closed 同侧:
+# "查不了"不等于"不存在",不落 401 也不落 500,让客户端按 Retry-After 重试。
 
 
 def hash_key(raw: str) -> str:
@@ -57,6 +59,10 @@ class KeyNotFound(Exception):
 
 class KeyInactive(Exception):
     pass
+
+
+class KeyStoreUnavailable(Exception):
+    """key 存储不可用(断连/超时):无法判定 key 有效性,由上层映射 503。"""
 
 
 def _cache_key(key_hash: str) -> str:
@@ -112,18 +118,27 @@ async def lookup(
             concurrency_limit=data.get("concurrency_limit"),
         )
 
-    async with session_factory() as db:
-        row = await db.execute(select(VirtualKey).where(VirtualKey.key_hash == key_hash))
-        vk = row.scalar_one_or_none()
-        if vk is None:
-            raise KeyNotFound(raw_key[:10])
-        if not vk.is_active:
-            raise KeyInactive(raw_key[:10])
-        # 租户预算随 miss 一次性带出(同会话 join 语义,不多一次往返)
-        tb = await db.execute(
-            select(Tenant.budget_tokens).where(Tenant.id == vk.tenant_id)
-        )
-        tenant_budget = tb.scalar_one_or_none()
+    try:
+        async with session_factory() as db:
+            row = await db.execute(select(VirtualKey).where(VirtualKey.key_hash == key_hash))
+            vk = row.scalar_one_or_none()
+            if vk is None:
+                raise KeyNotFound(raw_key[:10])
+            if not vk.is_active:
+                raise KeyInactive(raw_key[:10])
+            # 租户预算随 miss 一次性带出(同会话 join 语义,不多一次往返)
+            tb = await db.execute(
+                select(Tenant.budget_tokens).where(Tenant.id == vk.tenant_id)
+            )
+            tenant_budget = tb.scalar_one_or_none()
+    except (KeyNotFound, KeyInactive):
+        raise
+    except Exception as exc:
+        # PG 故障域混沌(2026-11-11 P1)实锤:此前 DB 断连异常穿透全链 → 裸 500
+        # (无信封、无 Retry-After)。DB 故障是"无法判定"而非"key 无效",上抛由
+        # 路由层映射 503 auth_unavailable 统一信封。
+        logger.warning("auth_store_unavailable", error=str(exc))
+        raise KeyStoreUnavailable(str(exc)) from exc
 
     try:
         await redis.set(
