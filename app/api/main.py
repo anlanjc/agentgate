@@ -108,6 +108,17 @@ def create_app(
         await app_.state.channel_router.aclose()
         await app_.state.redis.aclose()
         await app_.state.engine.dispose()
+        # GATE-6:优雅停运清掉本进程的 multiproc 指标文件 —— 不清则死进程的
+        # 计数器/直方图被 MultiProcessCollector 永久并入抓取(虚假高值);
+        # SIGKILL 等异常退出的残留由 Dockerfile CMD 启动前 rm -rf 兜底。
+        try:
+            import os
+
+            from prometheus_client import multiprocess
+
+            multiprocess.mark_process_dead(os.getpid())
+        except Exception as exc:
+            logger.warning("multiproc_cleanup_failed", error=str(exc))
         logger.info("app_stopped")
 
     import redis.asyncio as aredis
@@ -211,11 +222,14 @@ def create_app(
 
     @app_.get("/metrics")
     async def metrics_endpoint():
-        from prometheus_client import generate_latest
+        # GATE-6:多进程部署经 MultiProcessCollector 合并全部 worker 的 MMAP 文件;
+        # 单进程/测试口径回退进程内默认 registry(见 metrics.render_metrics)。
         from starlette.responses import Response
 
+        from app.observability.metrics import render_metrics
+
         return Response(
-            content=generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8"
+            content=render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8"
         )
 
     @app_.get("/admin/web")

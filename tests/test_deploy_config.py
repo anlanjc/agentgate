@@ -70,6 +70,23 @@ def test_k8s_secret_template_has_master_key_placeholder():
     assert re.search(r"AGENTGATE_CHANNEL_ENC_KEY\s*:", text)
 
 
+def test_dockerfile_multiproc_metrics_env():
+    """GATE-6(评审 4.0)回归:生产镜像必须开启 prometheus_client 多进程指标。
+
+    --workers 2 共享监听 socket,进程内默认 registry 使每次 /metrics 抓取只落到
+    其中一个 worker(轮流取半份 + 虚假 counter reset),HighErrorRate/
+    ThroughputDrop/StreamingTTFTP99High 告警系统性漏报/误抖。镜像必须注入
+    PROMETHEUS_MULTIPROC_DIR 且 CMD 在启动 worker 前清残留目录(SIGKILL 遗留的
+    死进程 MMAP 文件会被 MultiProcessCollector 永久并入抓取)。"""
+    dockerfile = (_DEPLOY.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert "PROMETHEUS_MULTIPROC_DIR" in dockerfile, (
+        "Dockerfile 缺 PROMETHEUS_MULTIPROC_DIR:--workers N 下 /metrics 轮流取半份(GATE-6)"
+    )
+    assert "rm -rf" in dockerfile and "mkdir -p" in dockerfile, (
+        "Dockerfile CMD 必须启动前清残留 multiproc 目录(死进程 MMAP 文件兜底)"
+    )
+
+
 def test_gateway_startup_fails_fast_without_master_key_in_prod():
     """网关启动 fail-fast:prod(及一切非白名单环境)缺主密钥时,Settings 校验器
     拒绝启动,报错含主密钥生成指引 —— 不许带病运行,也不许运维靠删 prod 蒙混。"""

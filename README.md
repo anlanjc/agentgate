@@ -97,7 +97,10 @@ python scripts/load_test.py --requests 2000 --concurrency 50 --out evidence/load
 
 方法论:客户端瓶颈会冒充服务端瓶颈 —— 用 aiohttp(C 解析器),服务端数字取同客户端同并发差值;
 每请求开销在 c=1 无排队条件下测,c=N 测的是容量与排队。绝对吞吐受单进程 GIL 约束,
-生产 `uvicorn --workers N` 水平扩展(与 LiteLLM 部署形态一致)。
+生产 `uvicorn --workers N` 水平扩展(与 LiteLLM 部署形态一致);多进程指标经
+  PROMETHEUS_MULTIPROC_DIR + MultiProcessCollector 合并抓取(GATE-6,评审 4.0:
+  进程内默认 registry 下 workers 共享监听 socket,/metrics 每抓取轮流取半份),
+  Dockerfile CMD 启动前清残留目录 + lifespan 停运 mark_process_dead 清死进程文件。
 
 ## 诚实的边界(面试主动讲,反而是加分)
 

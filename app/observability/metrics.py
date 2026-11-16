@@ -66,3 +66,26 @@ def status_class(status: int) -> str:
     if 400 <= status < 500:
         return "4xx"
     return "5xx"
+
+
+def render_metrics() -> bytes:
+    """GATE-6(评审 4.0):/metrics 渲染 —— 按部署形态选 registry。
+
+    多进程部署(uvicorn --workers N,PROMETHEUS_MULTIPROC_DIR 已设):各 worker
+    的指标落在共享目录的 MMAP 文件,经 MultiProcessCollector 合并输出 —— 修复前
+    直出进程内默认 registry,workers 共享监听 socket 下每次抓取只落到其中一个
+    worker(轮流取半份 + 虚假 counter reset),HighErrorRate/ThroughputDrop/
+    StreamingTTFTP99High 告警系统性漏报/误抖。
+    单进程/测试/开发口径(env 未设):回退进程内默认 registry,行为与修复前一致。
+    """
+    import os
+
+    from prometheus_client import CollectorRegistry, generate_latest, multiprocess
+
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR") or os.environ.get("prometheus_multiproc_dir"):
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return generate_latest(registry)
+    from prometheus_client import REGISTRY
+
+    return generate_latest(REGISTRY)
