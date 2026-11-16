@@ -171,3 +171,74 @@ async def test_redis_down_router_degrades():
         await router.mark_failure("ch-a")  # 不抛异常即通过
     finally:
         await dead.aclose()
+
+
+# ---- GATE-9:冷却窗时钟纪律(写入与过滤必须同源 Redis TIME,对齐 GW-4) ----
+
+
+class _FastClock:
+    """把"本地墙钟"拨快 skew 秒,模拟双副本部署里的快钟副本(k8s replicas=2)。
+
+    注入点 app.router.failover.time 是旧实现消费的时钟源;修复后该模块不再
+    读取本地墙钟,此注入自然失效 —— "注入失效仍绿"正是修复的判别点。
+    """
+
+    def __init__(self, skew_s: float = 120.0) -> None:
+        self._skew = skew_s
+
+    def time(self) -> float:
+        return time.time() + self._skew
+
+
+async def _redis_now_ms(redis) -> int:
+    seconds, micros = await redis.time()
+    return seconds * 1000 + micros // 1000
+
+
+async def test_cooldown_filter_uses_redis_clock(redis_client, monkeypatch):
+    """GATE-9:候选过滤的 now 必须取 Redis 时钟,与冷却 deadline 同源。
+
+    场景:另一副本刚用 Redis 时钟把 ch-a 冷却 60s;本副本本地墙钟快 120s。
+    本地口径下冷却窗"已过期"→ 快钟副本往别的副本刚冷却的渠道继续打流量;
+    Redis 口径下冷却窗未到 → ch-a 对本副本不可见。
+    """
+    from app.router.failover import ChannelRouter
+
+    monkeypatch.setattr("app.router.failover.time", _FastClock(), raising=False)
+    router = ChannelRouter(redis_client)
+    router.register("ch-a", object())
+    router.register("ch-b", object())
+    await redis_client.hset(
+        "gate:ch:ch-a", mapping={"cooldown_until_ms": await _redis_now_ms(redis_client) + 60_000}
+    )
+    cands = await router.candidates()
+    assert cands == ["ch-b"], f"快钟副本漏判冷却窗: {cands}"
+
+
+async def test_mark_failure_deadline_uses_redis_clock(redis_client, monkeypatch):
+    """GATE-9:mark_failure 写入的冷却 deadline 基于 Redis 时钟(≈+60s),非本地墙钟。"""
+    from app.router.failover import COOLDOWN_MS, ChannelRouter
+
+    monkeypatch.setattr("app.router.failover.time", _FastClock(), raising=False)
+    router = ChannelRouter(redis_client)
+    router.register("ch-a", object())
+    await router.mark_failure("ch-a")
+    st = await router.state_of("ch-a")
+    delta = st["cooldown_until_ms"] - await _redis_now_ms(redis_client)
+    # 旧实现:deadline = 快钟本地 +60s → 距 Redis now ≈180s;修复后 ≈60s
+    assert 0 < delta <= COOLDOWN_MS + 2_000, f"deadline 偏离 Redis 时钟: delta={delta}ms"
+    assert st["fail_streak"] == 1
+
+
+async def test_mark_rate_limited_deadline_uses_redis_clock(redis_client, monkeypatch):
+    """GATE-9:mark_rate_limited 的冷却窗(Retry-After=5s)基于 Redis 时钟,非本地墙钟。"""
+    from app.router.failover import ChannelRouter
+
+    monkeypatch.setattr("app.router.failover.time", _FastClock(), raising=False)
+    router = ChannelRouter(redis_client)
+    router.register("ch-a", object())
+    await router.mark_rate_limited("ch-a", 5)
+    st = await router.state_of("ch-a")
+    delta = st["cooldown_until_ms"] - await _redis_now_ms(redis_client)
+    # 旧实现:deadline = 快钟本地 +5s → 距 Redis now ≈125s;修复后 ≈5s
+    assert 0 < delta <= 5_000 + 2_000, f"deadline 偏离 Redis 时钟: delta={delta}ms"
