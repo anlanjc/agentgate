@@ -1,5 +1,13 @@
 # agentgate 依赖锁(P4 工程化):pip freeze 全量锁定,保证 CI/复现环境版本一致
 # 生成:.venv/Scripts/python -m pip freeze > requirements.lock(改 requirements.txt 后重新生成)
+# GATE-7(评审 4.0):上一版 lock 缺 requirements.txt 声明的
+# opentelemetry-exporter-otlp-proto-grpc 及其硬依赖 grpcio/protobuf —— 生成环境本身
+# 缺依赖,自述"全量锁定"名不副实;按 lock 重建的环境带生产 OTEL 配置
+# (compose/k8s 均强制 EXPORTER=otlp)启动即 ModuleNotFoundError 崩溃循环。
+# 本版已补:exporter 1.45.2 / opentelemetry-proto 1.45.2 / otlp-common 0.66b2 /
+# grpcio 1.85.1 / protobuf 7.36.2 / googleapis-common-protos 1.76.0;
+# 静态回归 tests/test_deploy_config.py::test_requirements_lock_covers_declared_deps
+# + tests/test_m6_tracing.py::test_otlp_exporter_importable_and_setup_smoke 双闸钉住。
 # 用法:CI 或复现环境 pip install -r requirements.lock;开发装新版依赖仍用 requirements.txt
 
 aiohappyeyeballs==2.7.1
@@ -21,7 +29,9 @@ fakeredis==2.40.0
 fastapi==0.162.0
 fasteners==0.20
 frozenlist==1.8.0
+googleapis-common-protos==1.76.0
 greenlet==3.5.6
+grpcio==1.85.1
 h11==0.16.0
 httpcore==1.0.9
 httpcore2==2.16.0
@@ -39,6 +49,10 @@ mcp==2.3.0
 mcp-types==2.3.0
 multidict==7.2.1
 opentelemetry-api==1.45.2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-grpc==1.45.2
+opentelemetry-proto==1.45.2
 opentelemetry-sdk==1.45.2
 opentelemetry-semantic-conventions==0.66b2
 packaging==26.3
@@ -47,6 +61,7 @@ platformdirs==4.14.2
 pluggy==1.7.0
 prometheus_client==0.26.0
 propcache==0.5.4
+protobuf==7.36.2
 psutil==7.2.2
 pycparser==3.12
 pydantic==2.14.2

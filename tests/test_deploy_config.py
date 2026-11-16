@@ -107,3 +107,33 @@ def test_gateway_startup_fails_fast_without_master_key_in_prod():
         channel_enc_key=crypto.generate_key(),
     )
     assert s.channel_enc_key.startswith("enc:v1:") or len(s.channel_enc_key) > 40
+
+
+def test_requirements_lock_covers_declared_deps():
+    """GATE-7(评审 4.0)回归:lock 自述 pip freeze 全量锁定,却缺 requirements.txt
+    声明的 opentelemetry-exporter-otlp-proto-grpc 及其硬依赖 grpcio/protobuf ——
+    生成 lock 的环境本身缺依赖;按 lock 重建的环境带生产 OTEL 配置启动即
+    ModuleNotFoundError 崩溃循环。本测试做两件静态守卫:①关键包必须在内;
+    ②requirements.txt 每个顶层声明都必须能在 lock 找到同名锁(防再漂移)。"""
+    root = _DEPLOY.parent
+    lock = (root / "requirements.lock").read_text(encoding="utf-8")
+    declared = (root / "requirements.txt").read_text(encoding="utf-8")
+
+    def _norm(name: str) -> str:
+        return name.strip().lower().replace("_", "-")
+
+    def _pkg_name(line: str) -> str:
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line or line.startswith("-"):
+            return ""
+        return _norm(line.split("[", 1)[0].split(">", 1)[0].split("=", 1)[0].split("<", 1)[0].split("!", 1)[0])
+
+    lock_names = {_pkg_name(l) for l in lock.splitlines()}
+    lock_names.discard("")
+    for pkg in ("opentelemetry-exporter-otlp-proto-grpc", "grpcio", "protobuf"):
+        assert pkg in lock_names, f"requirements.lock 缺 {pkg}(GATE-7:lock 复现环境 OTEL 崩溃循环)"
+
+    req_names = {_pkg_name(l) for l in declared.splitlines()}
+    req_names.discard("")
+    missing = sorted(n for n in req_names if n not in lock_names)
+    assert not missing, f"requirements.txt 声明但 lock 未锁: {missing}(lock 不再是全量口径)"

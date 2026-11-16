@@ -161,3 +161,31 @@ async def test_no_tracing_no_traceparent_header(auth_gateway):
     r = await client.post("/v1/chat/completions", json=_body(), headers=auth_headers(raw))
     assert r.status_code == 200
     assert r.headers.get("traceparent") is None
+
+
+def test_otlp_exporter_importable_and_setup_smoke():
+    """GATE-7(评审 4.0)回归:按 requirements.lock 重建的环境带生产 OTEL 配置
+    (compose 与 k8s configmap 均强制 AGENTGATE_OTEL_EXPORTER=otlp)启动时
+    create_app→setup_tracing 即 ModuleNotFoundError、uvicorn 崩溃循环 ——
+    tracing.py:52 的惰性 import 无 try/except,而 CI 双 job 装的是 lock 且 otlp
+    路径此前零测试覆盖(旧 lock 缺 exporter/grpcio/protobuf,生成环境本身缺依赖)。
+
+    本测试钉住两件事:①exporter 包随 lock 可导入(缺包即红,消除惰性 import 盲区);
+    ②otlp 配置下 setup_tracing 能完成装配 —— OTLPSpanExporter 构造是惰性 gRPC
+    channel,不发起网络连接,离线可跑(BatchSpanProcessor 亦不在构造期导出)。"""
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # noqa: F401
+
+    from app.config import Settings
+    from app.observability.tracing import reset_tracing, setup_tracing
+
+    reset_tracing()
+    try:
+        s = Settings(
+            _env_file=None, otel_enabled=True, otel_exporter="otlp",
+            otel_otlp_endpoint="http://127.0.0.1:4317",
+        )
+        tracer = setup_tracing(s)
+        assert tracer is not None
+        # span 走 BatchSpanProcessor,构造期无网络;真实导出为部署日冒烟动作
+    finally:
+        reset_tracing()
