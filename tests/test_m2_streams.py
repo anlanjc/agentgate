@@ -488,3 +488,38 @@ async def test_worker_self_heals_after_redis_data_loss(queue_env):
             break
         await asyncio.sleep(0.05)
     assert q.processed >= 2, f"worker 未自愈: processed={q.processed}"
+
+
+# ---------- GATE-5(评审 4.0)回归:DLQ 淘汰纪律 ----------
+
+
+async def test_dlq_trimmed_to_cap(queue_env, monkeypatch):
+    """死信流只 XADD 从不裁剪 → 故障风暴下每个死任务永久占一条 Redis 流内存,
+    违背模块头自述的"Stream 无限膨胀"纪律(主流 ACK 后 XDEL,DLQ 却无界)。
+    对齐 Redis 语义缓存 200 条上限纪律:XADD 后 XTRIM 精确裁剪,保最近
+    DLQ_MAX_ENTRIES 条(生产缺省 200,测试 patch 到 5 提速)。"""
+    q, sf, received, redis = queue_env
+    monkeypatch.setattr("app.queue.streams.DLQ_MAX_ENTRIES", 5)
+    q._max_attempts = 1  # 一次失败即死信,提速
+
+    async def bad_handler(task_type: str, payload: dict) -> dict:
+        raise RuntimeError(f"boom {payload.get('n')}")
+
+    q._handler = bad_handler
+    async with sf() as db:
+        for i in range(8):
+            await q.enqueue(db, "t", {"n": i}, idempotency_key=f"dlq-{i}")
+    await q.start()
+    for _ in range(200):
+        if q.dead >= 8:
+            break
+        await asyncio.sleep(0.03)
+    assert q.dead == 8
+    # 精确裁剪(非 approximate):上界硬保证,保最近 5 条
+    assert await redis.xlen(DLQ_STREAM) == 5
+    entries = await redis.xrange(DLQ_STREAM)
+    kept_errors = [fields["error"] for _, fields in entries]
+    assert kept_errors == [f"boom {i}" for i in range(3, 8)], (
+        f"裁剪应保留最近 5 条: {kept_errors}"
+    )
+    await q.stop()

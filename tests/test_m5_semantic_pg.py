@@ -88,3 +88,65 @@ async def test_pgvector_tenant_isolation(auth_gateway):
     )
     assert r.status_code == 200
     assert r.headers.get("x-cache") != "SEMANTIC_HIT"  # 跨租户不召回
+
+
+def _vec_literal(vec: list[float]) -> str:
+    return "[" + ",".join(f"{v:.8f}" for v in vec) + "]"
+
+
+async def _count_entries(engine) -> int:
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        return (await conn.execute(text("SELECT count(*) FROM semantic_entries"))).scalar_one()
+
+
+async def test_pgvector_expired_rows_are_purged(auth_gateway, monkeypatch):
+    """GATE-5(评审 4.0)回归:pgvector 语义缓存过期行必须有淘汰纪律。
+
+    修复前每条成功响应 INSERT 一行且无唯一约束无淘汰(TTL 仅查询侧按 created_at
+    过滤,注释自述'向量列不设 TTL —— 过期由查询侧按 created_at 过滤')—— 过期行
+    连同 HNSW 索引永久留存,表与索引无界增长最终拖垮 PG,同问题重复插入还叠加
+    重复行。修复后 cleanup_expired 按 created_at < now-ttl 批量 DELETE,store_pg
+    消费点节流触发(默认 60s 周期,测试 patch 到 0 立即触发)。"""
+    from sqlalchemy import text
+
+    from app.cache import semantic_pg
+
+    client, app, mock, raw = auth_gateway
+    await _enable_pgvector(app)  # semantic_cache_ttl=600
+    engine = app.state.engine
+
+    # 3 行过期(2h 前,同问题重复插重复行——修复前无唯一约束的真实形态)+ 1 行新鲜
+    async with engine.begin() as conn:
+        for i in range(3):
+            await conn.execute(text(
+                "INSERT INTO semantic_entries (tenant_id, model, ctx, question, answer,"
+                " embedding, created_at) VALUES ('t-old','mock-model','ctx','old q','{}'::jsonb,"
+                " CAST(:v AS vector), now() - make_interval(secs => :age))"
+            ).bindparams(v=_vec_literal([0.1] * 128), age=7200))
+    await semantic_pg.store_pg(
+        engine, app.state.embedder, "t-test", "mock-model", "ctx", "fresh q",
+        {"answer": "ok"}, 600, dim=128,
+    )
+    assert await _count_entries(engine) == 4
+
+    # 直接清理:恰好删掉 3 行过期,新鲜行保留
+    deleted = await semantic_pg.cleanup_expired(engine, ttl=600)
+    assert deleted == 3
+    assert await _count_entries(engine) == 1
+
+    # 消费点节流钩子:patch 周期到 0,再插 1 行过期后 store_pg 触发清理
+    monkeypatch.setattr(semantic_pg, "CLEANUP_INTERVAL_SECONDS", 0.0)
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO semantic_entries (tenant_id, model, ctx, question, answer,"
+            " embedding, created_at) VALUES ('t-old','mock-model','ctx','stale q','{}'::jsonb,"
+            " CAST(:v AS vector), now() - make_interval(secs => :age))"
+        ).bindparams(v=_vec_literal([0.1] * 128), age=7200))
+    assert await _count_entries(engine) == 2
+    await semantic_pg.store_pg(
+        engine, app.state.embedder, "t-test", "mock-model", "ctx", "fresh q 2",
+        {"answer": "ok"}, 600, dim=128,
+    )
+    assert await _count_entries(engine) == 2, "store_pg 节流清理未生效:过期行残留"

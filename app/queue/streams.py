@@ -41,6 +41,12 @@ GROUP = "gate-workers"
 
 OUTBOX_GRACE_SECONDS = 2.0
 MAINTENANCE_INTERVAL_SECONDS = 2.0
+# GATE-5(评审 4.0):DLQ 淘汰纪律 —— 死信流此前只 XADD 从不裁剪,系统性 handler
+# 故障风暴下每个死任务永久占一条流内存,违背模块头"Stream 无限膨胀"纪律(主流
+# ACK 后 XDEL)。对齐 Redis 语义缓存 200 条上限(app/cache/semantic.py):XADD 后
+# XTRIM 精确裁剪(approximate=False,上界硬保证),保最近 N 条;死信审计另有
+# task_records.status='dead' 全量可查(账本是事实来源),流内只保热窗口。
+DLQ_MAX_ENTRIES = 200
 
 
 def _utcnow() -> datetime:
@@ -453,6 +459,14 @@ class TaskQueue:
                         DLQ_STREAM,
                         {"task_id": task_id, "type": task_type, "error": str(exc)[:500]},
                     )
+                    try:
+                        # GATE-5:紧随 XADD 裁剪 DLQ;失败降级告警 —— 消息 ACK 仍要
+                        # 执行,裁剪漏一轮由下次死信补上(账本 dead 状态不依赖流)。
+                        await self._redis.xtrim(
+                            DLQ_STREAM, maxlen=DLQ_MAX_ENTRIES, approximate=False
+                        )
+                    except Exception as trim_exc:
+                        logger.warning("dlq_trim_failed", error=str(trim_exc))
                     await self._ack_and_delete(msg_id)
                     self.dead += 1
                     try:

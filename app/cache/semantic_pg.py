@@ -13,10 +13,19 @@
 """
 
 import json
+import time
 
 from app.log import get_logger
 
 logger = get_logger("cache.semantic_pg")
+
+# GATE-5(评审 4.0):淘汰纪律 —— 过期行(created_at < now-ttl)由 cleanup_expired
+# 批量 DELETE,store_pg 消费点节流触发(与 TaskQueue._periodic_maintenance 同款
+# 时间片思路,但挂在缓存自己的写入口,不跨模块耦合任务队列)。修复前过期行连同
+# HNSW 索引永久留存,表与索引无界增长最终拖垮 PG;同问题重复插入还叠加重复行。
+CLEANUP_INTERVAL_SECONDS = 60.0
+CLEANUP_BATCH_LIMIT = 500
+_last_cleanup_at = 0.0
 
 
 async def ensure_table(engine, dim: int) -> None:
@@ -60,7 +69,12 @@ def _vec_literal(vec: list[float]) -> str:
 
 async def store_pg(engine, embedder, tenant_id: str, model: str, ctx: str,
                    question: str, body: dict, ttl: int, dim: int) -> None:
-    """写入(向量列不设 TTL —— 过期由查询侧按 created_at 过滤,见 search_pg)。"""
+    """写入;过期行的物理淘汰由消费点节流触发 cleanup_expired(GATE-5)。
+
+    查询侧仍按 created_at 过滤过期行(search_pg)—— 逻辑过期即时生效,物理
+    DELETE 只是回收表与 HNSW 索引空间,两者解耦。
+    """
+    global _last_cleanup_at
     if ttl <= 0:
         return
     from sqlalchemy import text
@@ -78,6 +92,38 @@ async def store_pg(engine, embedder, tenant_id: str, model: str, ctx: str,
                          a=json.dumps(body, ensure_ascii=False), v=_vec_literal(vec)))
     except Exception as exc:
         logger.warning("semantic_pg_store_degraded", error=str(exc))
+        return
+
+    # GATE-5:消费点节流清理 —— 写入成功后按时间片检查一次,到期即批量 DELETE
+    # 过期行。清理失败降级为告警(缓存是优化不是正确性,下个周期重试)。
+    now = time.monotonic()
+    if now - _last_cleanup_at < CLEANUP_INTERVAL_SECONDS:
+        return
+    _last_cleanup_at = now
+    try:
+        deleted = await cleanup_expired(engine, ttl=ttl)
+        if deleted:
+            logger.info("semantic_pg_expired_purged", count=deleted)
+    except Exception as exc:
+        logger.warning("semantic_pg_cleanup_degraded", error=str(exc))
+
+
+async def cleanup_expired(engine, ttl: int, limit: int = CLEANUP_BATCH_LIMIT) -> int:
+    """批量删除过期行(created_at < now-ttl),返回删除行数。
+
+    有界批次:单次最多 limit 行 —— 长期未清理的积压按周期分批回收,DELETE 的
+    锁与 WAL 压力有上界;按 created_at 升序删最旧的。
+    """
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        result = await conn.execute(text(
+            "DELETE FROM semantic_entries WHERE id IN ("
+            " SELECT id FROM semantic_entries"
+            " WHERE created_at < now() - make_interval(secs => :ttl)"
+            " ORDER BY created_at LIMIT :limit)"
+        ).bindparams(ttl=ttl, limit=int(limit)))
+        return result.rowcount or 0
 
 
 async def search_pg(engine, embedder, tenant_id: str, model: str, ctx: str,
