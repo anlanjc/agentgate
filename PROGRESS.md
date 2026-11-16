@@ -36,6 +36,15 @@
 
 ## 已完成明细(追加区)
 
+- [1B3-GATE 2026-11-16] 评审 4.0 修复轮(报告 interview/reviews/review_report_4.md)名下 GATE-1~7 confirmed 全收口,一问题一提交先红后绿,**SQLite 144+3skip / PG 147 全绿(2026-11-16 实跑;基线 133+2skip/135,净增 11 项其中 1 项 PG 门控)**,基线 9192879 未 push:
+  - **GATE-1(P1)af48181**:k8s configmap 七键无 ENVIRONMENT → Settings 缺省 'dev' 落 NON_PROD 白名单直接 return,部署面三道 fail-closed 安全闸静默失效(compose 已 prod,k8s fail-open)——configmap 显式 `AGENTGATE_ENVIRONMENT: "prod"` + secret 占位值全改 MUST-REPLACE 起头(grep 可审计)+ deploy/k8s/README 同步;静态回归钉 configmap 必含非白名单 ENVIRONMENT;
+  - **GATE-2(P1)fbd10bb**:幂等 409 冲突路径泄漏并发槽(409 raise 直达 errors.py 全局 handler 无释放点,ACQUIRE_LUA 每次 acquire 刷 EXPIRE 300s → 持续重试侵蚀额度直至整 key 429 锁死)——`_slot_guard` 请求级一次性收尾闸(released 单向旗防双重 DECR)+ 准入后区域统一 try/except BaseException 逃逸兜底,_enqueue_error 4 处调用点全量走闸;对照 agentgate-go main.go chatCompletions 统一收尾 defer+slotHeld(Go 结构性避开,回归 m2_test.go);回归:预置在途槽+幂等锁 → 409 → conc 归位 + 第三请求可占槽(修复前红);
+  - **GATE-4(P1)1d17ef7**:失败任务重试/死信推进只依赖空轮(_read_new 返回 0 才 reclaim),持续负载(≥5 任务/s)下永远饿死,失败消息滞留 PEL 无上界——reclaim 挂进 _periodic_maintenance(2s 周期),空轮即时 reclaim 保留;回归:预置 300 条积压使 drain 期每轮 handled>0(结构性排除空轮),断言死信在新消息排空前推进(真 Redis 口径,修复前红 dead=0);
+  - **GATE-5(P1)159b9bb**:①pgvector 语义缓存只 INSERT 无淘汰(过期行连 HNSW 索引无界增长拖垮 PG)——cleanup_expired 按 created_at<now-ttl 有界批量 DELETE(500/次删最旧),store_pg 消费点节流触发(60s 周期,失败降级);②DLQ 只 XADD 从不裁剪——XTRIM 精确硬上界 DLQ_MAX_ENTRIES=200(对齐 Redis 语义缓存 200 条纪律,死信审计仍以 task_records.status='dead' 全量为准);回归双份(PG 口径回填过期行清理断言 / patch 上限 5 后 8 死信流内恰保最近 5 条);
+  - **GATE-6(P1)6f182c7**:Dockerfile --workers 2 共享监听 socket × /metrics 进程内默认 registry(全仓无 multiproc 配置)→ 指标轮流取半份+虚假 counter reset,告警系统性漏报——metrics.render_metrics() 按形态分派(PROMETHEUS_MULTIPROC_DIR 已设 → MultiProcessCollector 合并 MMAP;未设回退默认 registry 行为不变),Dockerfile ENV + CMD 启动前 rm -rf 清残留,lifespan 停运 mark_process_dead,README 水平扩展段同步;回归:双子进程递增 → 合并抓取 requests_total=总和(修复前轮流取半份)+ TTFT 桶跨进程合并 + env 未设回退 + lifespan 驱动断言 + Dockerfile 静态闸;
+  - **GATE-7(P1)9e749e8**:requirements.lock 自述 freeze 全量却缺 otlp exporter 及 grpcio/protobuf(生成环境本身缺依赖)→ 按 lock 重建环境带生产 OTEL 配置启动即 ModuleNotFoundError 崩溃循环——本地 .venv pip install 成功(清华镜像:exporter 1.45.2/grpcio 1.85.1/protobuf 7.36.2/opentelemetry-proto/googleapis-common-protos/otlp-common)后 freeze 重生成 lock(恢复 pywin32 sys_platform 标记,freeze 不再输出否则 Linux CI 装锁会炸);双闸:静态 lock⊇requirements.txt 顶层声明(防再漂移,对旧 lock 红)+ otlp setup_tracing 装配冒烟(OTLPSpanExporter 惰性 channel 离线可跑);
+  - GATE-8 归 Go 侧不动;GATE-3 已驳回不涉及。诚实边界:①回归红绿验证在真 Redis(便携 5.0.14.1)+ pgserver 16.2(vector 0.6.2,AGENTGATE_TEST_PG_URL 外部 61555 实例)口径;②fakeredis 口径下既有 test_outbox_sweeper_republishes_after_xadd_failure 存在时序 flaky(基线代码同样复现,非本轮引入,真 Redis 下稳定)——与轮内改动无关,如实留档;③GATE-7 import 冒烟本机因 venv 已装包恒绿,红态在 lock 复现环境(CI)显形。
+
 - [AG-1 2026-11-01] 立项:环境侦察(无 Docker/PG/Redis,网络三条路实测)+ 本文件 + ADR-001/002/003 + ARCHITECTURE.md。便携 Redis 下载中、依赖经阿里镜像安装中。
 - [AG-2 2026-11-03] hardening 批次审阅与锁存(ds-update 轮 27 文件由 AG-2 复核后分 5 笔入库):
   ①test: PG 口径 schema 漂移防护(.pgdata 持久库旧 schema 残留致 14 假失败,会话开始 drop_all+create_all 重建;迁移验证职责分离)→ **AGENTGATE_TEST_PG=1 修复前 14 failed → 修复后 62 passed**;
