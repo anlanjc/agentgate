@@ -293,6 +293,16 @@ class TaskQueue:
             return
         self._last_maintenance = now
         try:
+            # GATE-4(评审 4.0):reclaim 挂进维护周期 —— 失败任务的重试/死信推进
+            # 此前完全依赖空轮(_run 里 _read_new 返回 0 才 reclaim),而 _read_new
+            # block=200ms 批量读,持续负载(handler 为 webhook 投递时约 ≥5 任务/s
+            # 即饱和)下空闲轮永不出现:失败消息滞留 PEL 无上界、max_attempts 的
+            # 死信推进被流量饿死 —— 高峰恰是最需要重试的场景。周期 reclaim 保证
+            # 重投延迟有界;空轮的即时 reclaim 保留(空闲期快速恢复路径)。
+            await self._reclaim_stale()
+        except Exception as exc:
+            logger.warning("stale_reclaim_failed", error=str(exc))
+        try:
             await self._outbox_sweep()
         except Exception as exc:
             logger.warning("outbox_sweep_failed", error=str(exc))

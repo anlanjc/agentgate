@@ -386,6 +386,50 @@ async def test_dead_write_lost_race_no_false_dlq(queue_env):
     assert await redis.xlen(TASK_STREAM) == 0
 
 
+async def test_reclaim_progresses_under_sustained_load(queue_env, monkeypatch):
+    """GATE-4(评审 4.0)回归:持续负载下 reclaim 仍推进重试/死信(死信上界可达)。
+
+    修复前失败任务的重试与死信推进完全依赖 _reclaim_stale,而它只在 _read_new
+    返回 0 的空轮执行 —— _read_new block=200ms 批量读,持续负载(handler 为
+    webhook 投递时约 ≥5 任务/s 即饱和)下每轮 handled>0,空闲轮永不出现:失败
+    消息滞留 PEL 无上界、max_attempts 的死信推进被流量饿死 —— 高峰恰是最需要
+    重试的场景。修复后 reclaim 挂进 _periodic_maintenance 维护周期(2s),空闲轮
+    即时 reclaim 保留(快速恢复路径)。
+
+    判别口径(结构化,不赌空轮时序):预置 300 条积压 → drain 期内每轮
+    _read_new 必返回 >0(空轮结构性不存在);断言"死信推进"发生在"新消息
+    尚未排空"的窗口内。维护周期压到 50ms 只是测试提速,生产缺省 2s 同一
+    代码路径。"""
+    q, sf, received, redis = queue_env
+    monkeypatch.setattr("app.queue.streams.MAINTENANCE_INTERVAL_SECONDS", 0.05)
+    q._auto_start = False  # 先备好积压再开闸,保住"负载窗口"结构
+
+    async def bad_handler(task_type: str, payload: dict) -> dict:
+        raise RuntimeError("webhook down under load")
+
+    q._handler = bad_handler
+    async with sf() as db:
+        for i in range(300):
+            await q.enqueue(db, "t", {"n": i}, idempotency_key=f"load-{i}")
+    assert await redis.xlen(TASK_STREAM) == 300
+
+    await q.start()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline:
+        if q.dead >= 1 or await redis.xlen(TASK_STREAM) == 0:
+            break
+        await asyncio.sleep(0.02)
+    remaining = await redis.xlen(TASK_STREAM)
+    # 修复前:drain 期内每轮 handled>0 → reclaim 饿死 → 新消息排空时 dead 仍 0;
+    # 修复后:维护周期 reclaim 推进 → 早期任务走完 3 次尝试进死信(远早于排空)
+    assert q.dead >= 1, (
+        f"持续负载(新消息积压期每轮 handled>0,无空轮)下死信推进被饿死:"
+        f" dead={q.dead}, 新消息剩余={remaining}"
+    )
+    await q.stop()
+
+
 async def test_lease_timestamp_uses_redis_clock_not_local(queue_env, monkeypatch):
     """GW-4 回归(租约时钟):把本进程本地时钟拨快 120s,updated_at 仍取
     Redis 服务器时钟 —— 修复前各副本用本地 _utcnow() 写租约、又用本地时钟
