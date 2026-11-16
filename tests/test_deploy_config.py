@@ -33,6 +33,35 @@ def test_compose_production_topology_requires_master_key():
         )
 
 
+def test_k8s_configmap_pins_environment_fail_closed():
+    """GATE-1(评审 4.0)回归:k8s configmap 必须显式携带 AGENTGATE_ENVIRONMENT,
+    且为非白名单值(prod)—— 修复前七个键无 ENVIRONMENT,Settings 缺省 'dev' 落入
+    NON_PROD_ENVIRONMENTS 白名单直接 return,k8s 生产面三道 fail-closed 安全闸
+    (admin_token 非默认/禁关 auth/必配加密主密钥)全部静默失效;compose 端
+    docker-compose.yml 已是 prod —— 同一交付物两端口径分裂,k8s 端 fail-open。"""
+    cm = yaml.safe_load((_DEPLOY / "k8s" / "configmap.yaml").read_text(encoding="utf-8"))
+    env = (cm.get("data") or {}).get("AGENTGATE_ENVIRONMENT")
+    assert env is not None, (
+        "k8s configmap 缺 AGENTGATE_ENVIRONMENT(GATE-1):Settings 缺省 dev "
+        "落入 NON_PROD 白名单直接 return,三道 fail-closed 安全闸静默失效"
+    )
+    from app.config import NON_PROD_ENVIRONMENTS
+
+    assert env.lower() not in NON_PROD_ENVIRONMENTS, (
+        f"AGENTGATE_ENVIRONMENT={env} 落在非生产白名单内:k8s 部署面安全闸被豁免"
+    )
+
+
+def test_k8s_secret_placeholders_carry_must_replace_marker():
+    """GATE-1 回归:secret.yaml 全部占位值必须带 MUST-REPLACE 强注记 ——
+    部署日 `kubectl get secret -o yaml` 肉眼可辨、grep 可审计,防漏换上线。"""
+    secret = yaml.safe_load((_DEPLOY / "k8s" / "secret.yaml").read_text(encoding="utf-8"))
+    data = secret.get("stringData") or {}
+    assert data, "secret.yaml stringData 为空"
+    for name, value in data.items():
+        assert "MUST-REPLACE" in str(value), f"{name} 占位值缺 MUST-REPLACE 强注记: {value}"
+
+
 def test_k8s_secret_template_has_master_key_placeholder():
     """k8s 交付件同口径:secret.yaml 必须有主密钥占位(部署日替换,不许遗漏)。"""
     import re

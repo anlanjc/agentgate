@@ -6,6 +6,11 @@ metadata:
   labels:
     app: agentgate
 data:
+  # GATE-1(评审 4.0):必须显式携带 ENVIRONMENT —— 缺省时 Settings 落 'dev',
+  # 命中 NON_PROD_ENVIRONMENTS 白名单直接 return,三道 fail-closed 安全闸
+  # (admin_token 非默认/禁关 auth/必配加密主密钥)在 k8s 部署面全部静默失效。
+  # 该不变量由 tests/test_deploy_config.py 静态回归钉住,删键会挂 CI。
+  AGENTGATE_ENVIRONMENT: "prod"
   AGENTGATE_UPSTREAM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   AGENTGATE_DB_URL: "postgresql+asyncpg://agentgate: REPLACE-VIA-SECRET@pg-host:5432/agentgate"
   AGENTGATE_REDIS_URL: "redis://redis-host:6379/0"
