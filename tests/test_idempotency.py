@@ -55,6 +55,61 @@ async def test_in_flight_conflict_returns_409(auth_gateway):
     await idempotency.release(app.state.redis, sk, token)
 
 
+async def test_409_conflict_releases_concurrency_slot(auth_gateway):
+    """GATE-2(评审 4.0)回归:幂等 409 冲突路径必须释放准入已占的并发槽。
+
+    复现(确定性,零时序依赖):预置"首请求在途" = 直接占 1 个并发槽 + 占幂等锁;
+    再带同一 Idempotency-Key 发请求 —— 过准入(conc 1→2 ≤ limit=2)后命中 409。
+    修复前:409 raise 直达 errors.py 全局 handler(纯 JSONResponse,无 background),
+    准入已占的槽永不释放 —— 每次 409 给 conc:{key_id} +1,ACQUIRE_LUA 每次 acquire
+    还刷新 EXPIRE 300s,持续重试(恰是 Idempotency-Key 的文档化用法)逐步侵蚀额度
+    直至整 key 429 锁死。对照 Go 版(agentgate-go main.go chatCompletions 统一收尾
+    defer + slotHeld 标记):Go 版结构性避开同族缺陷,回归见其 m2_test.go。
+    """
+    from app import idempotency
+    from app.ratelimit import concurrency
+
+    client, app, mock, raw = auth_gateway
+    k = (await client.post(
+        f"/admin/tenants/{TENANT_ID}/keys",
+        json={"name": "gate2-slot", "concurrency_limit": 2},
+    )).json()
+    h = auth_headers(k["key"])
+    key_id = k["key_id"]
+
+    async def conc() -> int:
+        v = await app.state.redis.get(f"conc:{key_id}")
+        return int(v or 0)
+
+    # 预置"首请求在途":直接占 1 槽 + 占幂等锁(确定性,免时序编排)
+    assert await concurrency.acquire(app.state.redis, key_id, 2)
+    assert await conc() == 1
+    sk = idempotency.storage_key(TENANT_ID, key_id, "gate2-slot-k")
+    lock_acquired, lock_token = await idempotency.acquire(app.state.redis, sk)
+    assert lock_acquired and lock_token
+
+    # 第二请求:过准入(conc 1→2)→ 幂等锁被占 → 409
+    r = await client.post(
+        "/v1/chat/completions", json=_body(),
+        headers={**h, "Idempotency-Key": "gate2-slot-k"},
+    )
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "idempotency_key_conflict"
+    # 修复前:泄漏 —— conc 停在 2(真实在途只有 1);修复后:释放回 1
+    assert await conc() == 1, "409 冲突路径泄漏并发槽:准入已占的槽未释放"
+
+    # 第三请求(不同幂等键):应可占槽执行 —— 修复前 conc=2 已吃满 limit=2,429 锁死
+    r3 = await client.post(
+        "/v1/chat/completions", json=_body(),
+        headers={**h, "Idempotency-Key": "gate2-slot-k3"},
+    )
+    assert r3.status_code == 200, f"409 泄漏侵蚀并发额度:第三请求被拒({r3.status_code})"
+
+    # 清理:释放预置槽与锁(r3 的槽由 _account background 自行释放)
+    await idempotency.release(app.state.redis, sk, lock_token)
+    await concurrency.release(app.state.redis, key_id)
+
+
 async def test_idempotency_scoped_by_tenant(auth_gateway):
     """作用域=租户+key:另一租户用同一个 Idempotency-Key 是独立请求,不被回放。"""
     client, app, mock, raw_a = auth_gateway

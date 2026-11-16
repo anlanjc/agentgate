@@ -409,8 +409,44 @@ def _record_metrics(
         )
 
 
-async def _enqueue_error(state, auth, model: str, request_id: str, status: int) -> None:
-    """错误路径的账本行:也走 Streams(错误低频,允许路径内小开销换全链一致)。"""
+def _slot_guard(state, auth: AuthResult | None):
+    """GATE-2(评审 4.0):请求级并发槽一次性收尾闸。
+
+    准入(_admit)占用 conc:{key_id} 后,收尾出口有三类:
+    - 成功/回放/缓存命中路径:挂 BackgroundTask(_account),响应真正结束时释放;
+    - 错误响应路径(_enqueue_error):在 finally 里释放;
+    - 异常逃逸路径(幂等 409 冲突、未捕获异常):修复前直达 errors.py 全局 handler
+      返回纯 JSONResponse —— 无 BackgroundTask、无释放点,槽每次 +1 永不归还;
+      ACQUIRE_LUA 每次 acquire 还刷新 EXPIRE 300s,持续重试(恰是 Idempotency-Key
+      的文档化用法)逐步侵蚀额度直至整 key 429 锁死。
+
+    本闸以 released 单向旗保证"每请求至多释放一次":错误响应路径与逃逸兜底可能先后
+    触发,直接裸 DECR 两次会在并发下吃掉其他请求刚占走的合法槽位(RELEASE_LUA 的
+    下限 0 只防负数,不防超额扣减)。对照 Go 版(agentgate-go main.go chatCompletions
+    统一收尾 defer + admitOutcome.slotHeld 标记,其 m2_test.go 有回归钉住):Go 由
+    defer 结构性避开同族缺陷;Python 版成功收尾在 BackgroundTask、流式收尾在 relay
+    finally,等价的 defer 语义在 v1_chat 里显式实现为 chat_completions 的逃逸兜底。
+    """
+    released = False
+
+    async def release() -> None:
+        nonlocal released
+        if auth is None or auth.concurrency_limit is None or released:
+            return
+        released = True
+        from app.ratelimit import concurrency
+
+        await concurrency.release(state.redis, auth.key_id)
+
+    return release
+
+
+async def _enqueue_error(state, auth, model: str, request_id: str, status: int, release=None) -> None:
+    """错误路径的账本行:也走 Streams(错误低频,允许路径内小开销换全链一致)。
+
+    release:GATE-2 请求级一次性收尾闸(chat_completions 注入)—— 并发槽释放统一
+    走闸,与异常逃逸兜底共用,防同请求双重 DECR。
+    """
     from app.queue.streams import TaskQueue
 
     tq: TaskQueue = state.task_queue
@@ -425,7 +461,9 @@ async def _enqueue_error(state, auth, model: str, request_id: str, status: int) 
         logger.warning("error_record_enque_failed", error=str(exc))
     finally:
         # 错误路径没有 BackgroundTask 记账:并发槽在这里释放(成功路径由 _account 释放)
-        if auth is not None and auth.concurrency_limit is not None:
+        if release is not None:
+            await release()
+        elif auth is not None and auth.concurrency_limit is not None:
             from app.ratelimit import concurrency
 
             await concurrency.release(state.redis, auth.key_id)
@@ -509,236 +547,269 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> Resp
     # ---- 准入(auth_enabled=False 为纯代理模式,仅测试/内网边缘鉴权场景)----
     auth: AuthResult | None = None
     r_admit = None
+    release_slot = None  # GATE-2:请求级并发槽一次性收尾闸(见 _slot_guard)
     if state.settings.auth_enabled:
         auth = await _authenticate(request, _bearer(request.headers.get("authorization")))
         r_admit = await _admit(request, auth, req.model)
-    rl_headers = _rate_limit_headers(auth, r_admit)
+        # GATE-2:准入已占 conc:{key_id},收尾闸就位
+        release_slot = _slot_guard(state, auth)
 
-    # 计费模式下的流式请求强制 include_usage:否则客户端不传该参数时,
-    # 上游不返回 usage,网关只能记 0 token(真实成本漏计)。请求体被增强,
-    # 响应仍是字节级透传;客户端会多收到一个 usage-only chunk(OpenAI 规范允许)。
-    if req.stream and state.settings.auth_enabled and state.settings.force_stream_usage:
-        stream_options = dict(payload.get("stream_options") or {})
-        stream_options["include_usage"] = True
-        payload["stream_options"] = stream_options
-
-    forward_headers = {k: v for k, v in request.headers.items() if k in _FORWARD_HEADERS}
-
-    # ---- Idempotency-Key(P2):重试安全,仅非流式(流式响应体不可重放,照常执行并留痕)----
-    idem_sk: str | None = None
-    idem_token: str | None = None  # GW-3:锁属主 token,release 只删自己的锁
-    raw_idem = (request.headers.get("idempotency-key") or "").strip()
-    if raw_idem:
-        if auth is None:
-            logger.warning("idempotency_requires_auth", request_id=request_id)
-        elif req.stream:
-            logger.warning("idempotency_skipped_for_stream", request_id=request_id)
-        else:
-            from app import idempotency
-
-            idem_sk = idempotency.storage_key(auth.tenant_id, auth.key_id, raw_idem)
-
-    # ---- W3C Trace Context(P4-2):client traceparent 提取为父上下文;响应头回传 ----
-    from app.observability import tracing as otel_tracing
-
-    trace_ctx = (
-        otel_tracing.incoming_context(request.headers) if r_tracer(state) else None
-    )
-    captured: dict = {"traceparent": None}
-
-    # ---- 流式:先调度渠道并开流(连接类异常发生在状态码提交前,可安全映射)----
-    if req.stream:
-        try:
-            channel, resp, opened = await _dispatch_stream(
-                state, payload, forward_headers, trace_ctx, captured
-            )
-        except ROUTE_ERRORS as exc:
-            status, message, code = _classify_upstream_exc(exc)
-            logger.warning("upstream_transport_error", error=str(exc), status=status)
-            await _enqueue_error(state, auth, req.model, request_id, status)
-            return _gateway_error(status, message, "bad_gateway", code)
-        except GatewayError as exc:
-            await _enqueue_error(state, auth, req.model, request_id, exc.status)
-            raise
-
-        if not opened:
-            # 渠道遍历后的合成响应(非流式错误透传 或 全渠道耗尽):也要进账本,
-            # 否则审计里会缺掉一整类流式失败请求。
-            latency_ms = (time.perf_counter() - request_t0) * 1000
-            record = _record(
-                auth, req.model, request_id, resp.status_code, None, None, latency_ms,
-                channel=channel or "exhausted",
-            )
-            _record_metrics(
-                auth, req.model, channel or "exhausted", resp.status_code, None,
-                latency_ms=latency_ms if resp.status_code == 200 else None,
-            )
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                media_type="application/json",
-                headers={"x-upstream-channel": channel or "exhausted"},
-                background=BackgroundTask(_account, request, auth, record),
-            )
-
-        # GW-5:completed=生成器自然跑完;accounted=已显式记账(防 background 双计)
-        holder: dict = {
-            "usage": None, "ttft_ms": None, "status": 200, "latency_ms": 0,
-            "completed": False, "accounted": False,
-        }
-
-        async def relay() -> AsyncIterator[bytes]:
-            acc = UsageAccumulator()
-
-            def on_first(ttft_ms: float) -> None:
-                holder["ttft_ms"] = round(ttft_ms, 2)
-                state.ttft_samples.append(round(ttft_ms, 2))
-                logger.info("ttft_ms", value=round(ttft_ms, 2), channel=channel)
-
-            try:
-                async for chunk in relay_stream(
-                    resp.aiter_raw(), on_first_event=on_first, start_time=request_t0
-                ):
-                    acc.feed(chunk)  # 旁观解析 usage,不影响透传字节
-                    yield chunk
-                if not acc.saw_done:
-                    # GW-9:干净截断探测 —— 上游关流但没发 [DONE]。修复前 relay
-                    # 正常走完、无任何标记,账本静默记 200,客户端把截断当完成。
-                    holder["status"] = 502
-                    logger.warning("upstream_stream_truncated_no_done", channel=channel)
-                    yield _sse_error_frame(
-                        "upstream stream ended without [DONE] (truncated)",
-                        "stream_truncated_no_done",
-                    )
-                holder["completed"] = True
-            except asyncio.CancelledError:
-                # 客户端断开:上游可能已产生 token,账本标 499,不伪装成 2xx。
-                holder["status"] = 499
-                raise
-            except READ_ERRORS as exc:
-                holder["status"] = 502
-                logger.warning("upstream_read_error_midstream", error=str(exc))
-                # GW-9:异常帧从自定义 {"message": ...} 改为网关统一错误信封
-                yield _sse_error_frame(
-                    "upstream read error mid-stream", "upstream_read_error_midstream"
-                )
-            finally:
-                # GW-5 修复顺序:纯内存赋值必须先于任何 await —— 断开取消经
-                # cancel scope 级联,取消作用域内的首个 await 会再抛 CancelledError,
-                # 排在其后的赋值/指标永远执行不到(断开即漏计的根因)。
-                if not holder["completed"] and holder["status"] == 200:
-                    # 生成器被中途终止但没走 CancelledError 分支(spec≥2.4 服务器:
-                    # 下游 send 失败 → OSError → 生成器被 GC/GeneratorExit 收尾),
-                    # 客户端已断开 —— 按 499 口径记账,不伪装成 200。
-                    holder["status"] = 499
-                holder["usage"] = acc.usage
-                holder["latency_ms"] = int((time.perf_counter() - request_t0) * 1000)
-                # 指标必须在流真正结束后记:此前在构造 StreamResponse 时记,
-                # TTFT/usage 永远还是 None/0,线上看板会展示假数据。
-                _record_metrics(
-                    auth,
-                    req.model,
-                    channel or "exhausted",
-                    holder["status"],
-                    holder["usage"],
-                    ttft_ms=holder["ttft_ms"],
-                )
-                logger.info(
-                    "stream_done",
-                    duration_ms=holder["latency_ms"],
-                    status=holder["status"],
-                )
-                # 关闭上游连接:shield 包裹 —— 取消作用域内普通 await 会再抛
-                # CancelledError,close 会被打断;shield 让 close 在独立任务里跑完。
-                try:
-                    await asyncio.shield(resp.aclose())
-                except asyncio.CancelledError:
-                    pass  # close 已移交 shield 任务继续,取消由外层 except 分支再抛
-                except Exception as exc:
-                    logger.warning("upstream_stream_close_failed", error=str(exc))
-                # GW-5:记账不依赖 background —— spec≥2.4 服务器断开后 background
-                # 整个不跑(连账本行与并发槽释放都没有)。生成器未自然跑完即客户端
-                # 已断开:relay 收尾显式记账;background 若仍执行(spec<2.4)由
-                # accounted 闸让位,防止双计费。注意这里直接构造 record(不过
-                # make_record 的 accounted 闸 —— 那是给 background 的让位闸)。
-                if not holder["completed"] and not holder["accounted"]:
-                    holder["accounted"] = True
-                    explicit_record = _record(
-                        auth, req.model, request_id, holder["status"],
-                        holder["usage"], holder["ttft_ms"], holder["latency_ms"],
-                        channel=channel or "",
-                    )
-                    try:
-                        await asyncio.shield(_account(request, auth, explicit_record))
-                    except asyncio.CancelledError:
-                        # 取消作用域内让位:记账已移交 shield 任务继续跑完
-                        logger.info("stream_accounting_delegated", status=holder["status"])
-                    except Exception as exc:
-                        logger.warning("stream_accounting_failed", error=str(exc))
-
-        def make_record() -> dict | None:
-            if holder["accounted"]:
-                # GW-5:relay 收尾已显式记账,background 让位(防双计费)
-                return None
-            return _record(
-                auth, req.model, request_id, holder["status"],
-                holder["usage"], holder["ttft_ms"], holder["latency_ms"],
-                channel=channel or "",
-            )
-
-        return StreamingResponse(
-            relay(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "x-upstream-channel": channel or "exhausted",
-                **rl_headers,
-                **({"traceparent": captured["traceparent"]} if captured.get("traceparent") else {}),
-            },
-            background=BackgroundTask(_account, request, auth, make_record),
-        )
-    # 注意:传 make_record 本身(可调用),后台任务执行时才求值 —— 流式 usage 在流结束才可知
-
-    # ---- 非流式 ----
-    # Idempotency-Key 优先于一切缓存:重放是客户端重试语义的最强承诺。
-    if idem_sk is not None:
-        from app import idempotency
-
-        stored = await idempotency.lookup(state.redis, idem_sk)
-        if stored is not None:
-            logger.info("idempotent_replay", request_id=request_id)
-            # 回放不重计费:账本记 channel=replay、token=0(上游零成本,预算/TPM 不动)
-            record = _record(auth, req.model, request_id, stored["status"], None, None, 0, channel="replay")
-            _record_metrics(auth, req.model, "replay", stored["status"], None)
-            return Response(
-                content=json.dumps(stored["body"], ensure_ascii=False).encode(),
-                status_code=stored["status"],
-                media_type="application/json",
-                headers={"x-idempotent-replay": "true", "x-upstream-channel": "replay"},
-                background=BackgroundTask(_account, request, auth, record),
-            )
-        acquired, idem_token = await idempotency.acquire(
-            state.redis, idem_sk,
-            ttl_ms=state.settings.idempotency_lock_ttl_seconds * 1000,
-        )
-        if not acquired:
-            raise GatewayError(
-                409, "request with this Idempotency-Key is still in flight",
-                "invalid_request_error", "idempotency_key_conflict", retry_after_s=2,
-            )
+    # GATE-2:准入后区域统一收尾(对照 agentgate-go main.go chatCompletions 统一收尾
+    # defer + admitOutcome.slotHeld 标记,agentgate-go m2_test.go 有回归钉住 —— Go 版
+    # 由 defer 结构性避开同族缺陷)。修复前任何异常逃逸(幂等 409 冲突/未捕获异常)
+    # 直达 errors.py 全局 handler 返回纯 JSONResponse —— 无 BackgroundTask 收尾,准入
+    # 已占的并发槽永不释放;ACQUIRE_LUA 每次 acquire 还刷新 EXPIRE 300s,持续重试
+    # (恰是 Idempotency-Key 的文档化用法)逐步侵蚀额度直至整 key 429 锁死。
+    # Python 版成功收尾在 BackgroundTask(_account)、错误响应收尾在 _enqueue_error、
+    # 流式收尾在 relay finally,等价的 defer 语义显式写成这里的逃逸兜底。
     try:
-        return await _non_stream_core(
-            req, request, state, payload, request_id, request_t0, auth, idem_sk,
-            idem_token, forward_headers, rl_headers, trace_ctx, captured,
+        rl_headers = _rate_limit_headers(auth, r_admit)
+
+        # 计费模式下的流式请求强制 include_usage:否则客户端不传该参数时,
+        # 上游不返回 usage,网关只能记 0 token(真实成本漏计)。请求体被增强,
+        # 响应仍是字节级透传;客户端会多收到一个 usage-only chunk(OpenAI 规范允许)。
+        if req.stream and state.settings.auth_enabled and state.settings.force_stream_usage:
+            stream_options = dict(payload.get("stream_options") or {})
+            stream_options["include_usage"] = True
+            payload["stream_options"] = stream_options
+
+        forward_headers = {k: v for k, v in request.headers.items() if k in _FORWARD_HEADERS}
+
+        # ---- Idempotency-Key(P2):重试安全,仅非流式(流式响应体不可重放,照常执行并留痕)----
+        idem_sk: str | None = None
+        idem_token: str | None = None  # GW-3:锁属主 token,release 只删自己的锁
+        raw_idem = (request.headers.get("idempotency-key") or "").strip()
+        if raw_idem:
+            if auth is None:
+                logger.warning("idempotency_requires_auth", request_id=request_id)
+            elif req.stream:
+                logger.warning("idempotency_skipped_for_stream", request_id=request_id)
+            else:
+                from app import idempotency
+
+                idem_sk = idempotency.storage_key(auth.tenant_id, auth.key_id, raw_idem)
+
+        # ---- W3C Trace Context(P4-2):client traceparent 提取为父上下文;响应头回传 ----
+        from app.observability import tracing as otel_tracing
+
+        trace_ctx = (
+            otel_tracing.incoming_context(request.headers) if r_tracer(state) else None
         )
-    finally:
+        captured: dict = {"traceparent": None}
+
+        # ---- 流式:先调度渠道并开流(连接类异常发生在状态码提交前,可安全映射)----
+        if req.stream:
+            try:
+                channel, resp, opened = await _dispatch_stream(
+                    state, payload, forward_headers, trace_ctx, captured
+                )
+            except ROUTE_ERRORS as exc:
+                status, message, code = _classify_upstream_exc(exc)
+                logger.warning("upstream_transport_error", error=str(exc), status=status)
+                await _enqueue_error(state, auth, req.model, request_id, status, release=release_slot)
+                return _gateway_error(status, message, "bad_gateway", code)
+            except GatewayError as exc:
+                await _enqueue_error(state, auth, req.model, request_id, exc.status, release=release_slot)
+                raise
+
+            if not opened:
+                # 渠道遍历后的合成响应(非流式错误透传 或 全渠道耗尽):也要进账本,
+                # 否则审计里会缺掉一整类流式失败请求。
+                latency_ms = (time.perf_counter() - request_t0) * 1000
+                record = _record(
+                    auth, req.model, request_id, resp.status_code, None, None, latency_ms,
+                    channel=channel or "exhausted",
+                )
+                _record_metrics(
+                    auth, req.model, channel or "exhausted", resp.status_code, None,
+                    latency_ms=latency_ms if resp.status_code == 200 else None,
+                )
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    media_type="application/json",
+                    headers={"x-upstream-channel": channel or "exhausted"},
+                    background=BackgroundTask(_account, request, auth, record),
+                )
+
+            # GW-5:completed=生成器自然跑完;accounted=已显式记账(防 background 双计)
+            holder: dict = {
+                "usage": None, "ttft_ms": None, "status": 200, "latency_ms": 0,
+                "completed": False, "accounted": False,
+            }
+
+            async def relay() -> AsyncIterator[bytes]:
+                acc = UsageAccumulator()
+
+                def on_first(ttft_ms: float) -> None:
+                    holder["ttft_ms"] = round(ttft_ms, 2)
+                    state.ttft_samples.append(round(ttft_ms, 2))
+                    logger.info("ttft_ms", value=round(ttft_ms, 2), channel=channel)
+
+                try:
+                    async for chunk in relay_stream(
+                        resp.aiter_raw(), on_first_event=on_first, start_time=request_t0
+                    ):
+                        acc.feed(chunk)  # 旁观解析 usage,不影响透传字节
+                        yield chunk
+                    if not acc.saw_done:
+                        # GW-9:干净截断探测 —— 上游关流但没发 [DONE]。修复前 relay
+                        # 正常走完、无任何标记,账本静默记 200,客户端把截断当完成。
+                        holder["status"] = 502
+                        logger.warning("upstream_stream_truncated_no_done", channel=channel)
+                        yield _sse_error_frame(
+                            "upstream stream ended without [DONE] (truncated)",
+                            "stream_truncated_no_done",
+                        )
+                    holder["completed"] = True
+                except asyncio.CancelledError:
+                    # 客户端断开:上游可能已产生 token,账本标 499,不伪装成 2xx。
+                    holder["status"] = 499
+                    raise
+                except READ_ERRORS as exc:
+                    holder["status"] = 502
+                    logger.warning("upstream_read_error_midstream", error=str(exc))
+                    # GW-9:异常帧从自定义 {"message": ...} 改为网关统一错误信封
+                    yield _sse_error_frame(
+                        "upstream read error mid-stream", "upstream_read_error_midstream"
+                    )
+                finally:
+                    # GW-5 修复顺序:纯内存赋值必须先于任何 await —— 断开取消经
+                    # cancel scope 级联,取消作用域内的首个 await 会再抛 CancelledError,
+                    # 排在其后的赋值/指标永远执行不到(断开即漏计的根因)。
+                    if not holder["completed"] and holder["status"] == 200:
+                        # 生成器被中途终止但没走 CancelledError 分支(spec≥2.4 服务器:
+                        # 下游 send 失败 → OSError → 生成器被 GC/GeneratorExit 收尾),
+                        # 客户端已断开 —— 按 499 口径记账,不伪装成 200。
+                        holder["status"] = 499
+                    holder["usage"] = acc.usage
+                    holder["latency_ms"] = int((time.perf_counter() - request_t0) * 1000)
+                    # 指标必须在流真正结束后记:此前在构造 StreamResponse 时记,
+                    # TTFT/usage 永远还是 None/0,线上看板会展示假数据。
+                    _record_metrics(
+                        auth,
+                        req.model,
+                        channel or "exhausted",
+                        holder["status"],
+                        holder["usage"],
+                        ttft_ms=holder["ttft_ms"],
+                    )
+                    logger.info(
+                        "stream_done",
+                        duration_ms=holder["latency_ms"],
+                        status=holder["status"],
+                    )
+                    # 关闭上游连接:shield 包裹 —— 取消作用域内普通 await 会再抛
+                    # CancelledError,close 会被打断;shield 让 close 在独立任务里跑完。
+                    try:
+                        await asyncio.shield(resp.aclose())
+                    except asyncio.CancelledError:
+                        pass  # close 已移交 shield 任务继续,取消由外层 except 分支再抛
+                    except Exception as exc:
+                        logger.warning("upstream_stream_close_failed", error=str(exc))
+                    # GW-5:记账不依赖 background —— spec≥2.4 服务器断开后 background
+                    # 整个不跑(连账本行与并发槽释放都没有)。生成器未自然跑完即客户端
+                    # 已断开:relay 收尾显式记账;background 若仍执行(spec<2.4)由
+                    # accounted 闸让位,防止双计费。注意这里直接构造 record(不过
+                    # make_record 的 accounted 闸 —— 那是给 background 的让位闸)。
+                    if not holder["completed"] and not holder["accounted"]:
+                        holder["accounted"] = True
+                        explicit_record = _record(
+                            auth, req.model, request_id, holder["status"],
+                            holder["usage"], holder["ttft_ms"], holder["latency_ms"],
+                            channel=channel or "",
+                        )
+                        try:
+                            await asyncio.shield(_account(request, auth, explicit_record))
+                        except asyncio.CancelledError:
+                            # 取消作用域内让位:记账已移交 shield 任务继续跑完
+                            logger.info("stream_accounting_delegated", status=holder["status"])
+                        except Exception as exc:
+                            logger.warning("stream_accounting_failed", error=str(exc))
+
+            def make_record() -> dict | None:
+                if holder["accounted"]:
+                    # GW-5:relay 收尾已显式记账,background 让位(防双计费)
+                    return None
+                return _record(
+                    auth, req.model, request_id, holder["status"],
+                    holder["usage"], holder["ttft_ms"], holder["latency_ms"],
+                    channel=channel or "",
+                )
+
+            return StreamingResponse(
+                relay(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "x-upstream-channel": channel or "exhausted",
+                    **rl_headers,
+                    **({"traceparent": captured["traceparent"]} if captured.get("traceparent") else {}),
+                },
+                background=BackgroundTask(_account, request, auth, make_record),
+            )
+        # 注意:传 make_record 本身(可调用),后台任务执行时才求值 —— 流式 usage 在流结束才可知
+
+        # ---- 非流式 ----
+        # Idempotency-Key 优先于一切缓存:重放是客户端重试语义的最强承诺。
         if idem_sk is not None:
             from app import idempotency
 
-            # GW-3:compare-and-delete —— 只删自己持有的锁;锁过期被重试方接管的
-            # 场景下这里是无害 no-op(旧代码会无条件 delete,删掉重试方的锁)。
-            await idempotency.release(state.redis, idem_sk, idem_token)
+            stored = await idempotency.lookup(state.redis, idem_sk)
+            if stored is not None:
+                logger.info("idempotent_replay", request_id=request_id)
+                # 回放不重计费:账本记 channel=replay、token=0(上游零成本,预算/TPM 不动)
+                record = _record(auth, req.model, request_id, stored["status"], None, None, 0, channel="replay")
+                _record_metrics(auth, req.model, "replay", stored["status"], None)
+                return Response(
+                    content=json.dumps(stored["body"], ensure_ascii=False).encode(),
+                    status_code=stored["status"],
+                    media_type="application/json",
+                    headers={"x-idempotent-replay": "true", "x-upstream-channel": "replay"},
+                    background=BackgroundTask(_account, request, auth, record),
+                )
+            acquired, idem_token = await idempotency.acquire(
+                state.redis, idem_sk,
+                ttl_ms=state.settings.idempotency_lock_ttl_seconds * 1000,
+            )
+            if not acquired:
+                # GATE-2:409 冲突路径显式释放准入已占的并发槽 —— 修复前此 raise
+                # 直达 errors.py 全局 handler(纯 JSONResponse,无 background),槽
+                # 永不释放;经请求级一次性闸释放,与下方逃逸兜底共用,不会双重 DECR。
+                if release_slot is not None:
+                    await release_slot()
+                raise GatewayError(
+                    409, "request with this Idempotency-Key is still in flight",
+                    "invalid_request_error", "idempotency_key_conflict", retry_after_s=2,
+                )
+        try:
+            return await _non_stream_core(
+                req, request, state, payload, request_id, request_t0, auth, idem_sk,
+                idem_token, forward_headers, rl_headers, trace_ctx, captured,
+                release=release_slot,
+            )
+        finally:
+            if idem_sk is not None:
+                from app import idempotency
+
+                # GW-3:compare-and-delete —— 只删自己持有的锁;锁过期被重试方接管的
+                # 场景下这里是无害 no-op(旧代码会无条件 delete,删掉重试方的锁)。
+                await idempotency.release(state.redis, idem_sk, idem_token)
+    except BaseException:
+        # GATE-2:逃逸兜底(统一收尾 defer 的 except 半边)—— 准入已占的并发槽在
+        # 异常逃逸出 chat_completions 前释放。正常返回路径不经过这里(成功由
+        # BackgroundTask 收尾);错误响应路径已在 _enqueue_error 经同一把闸释放,
+        # 一次性旗保证这里是无害 no-op。shield:取消竞争中尽力释放,释放失败交给
+        # ACQUIRE_LUA 的 EXPIRE 300s 自愈,不遮掩原始异常。
+        if release_slot is not None:
+            try:
+                await asyncio.shield(release_slot())
+            except asyncio.CancelledError:
+                logger.warning("slot_release_delegated_on_escape")
+            except Exception as exc:
+                logger.warning("slot_release_failed_on_escape", error=str(exc))
+        raise
 
 
 async def _semantic_search(state, auth: AuthResult, model: str, ctx: str, question: str):
@@ -780,8 +851,13 @@ async def _non_stream_core(
     idem_sk: str | None, idem_token: str | None, forward_headers: dict,
     rl_headers: dict | None = None,
     trace_ctx=None, captured: dict | None = None,
+    release=None,
 ) -> Response:
-    """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。"""
+    """非流式主路径(从 chat_completions 拆出以承载 Idempotency-Key 的 try/finally)。
+
+    release:GATE-2 请求级并发槽一次性收尾闸,透传给 _enqueue_error —— 错误响应
+    路径与异常逃逸兜底共用同一把闸,防同请求双重 DECR。
+    """
     from app import idempotency
 
     # 响应缓存(默认关;只缓确定性请求,租户隔离键,语义见 app/cache/response.py)
@@ -887,12 +963,12 @@ async def _non_stream_core(
             await response_cache.release(state.redis, rkey)
         status, message, code = _classify_upstream_exc(exc)
         logger.warning("upstream_transport_error", error=str(exc), status=status)
-        await _enqueue_error(state, auth, req.model, request_id, status)
+        await _enqueue_error(state, auth, req.model, request_id, status, release=release)
         return _gateway_error(status, message, "bad_gateway", code)
     except GatewayError as exc:
         if sf_acquired:
             await response_cache.release(state.redis, rkey)
-        await _enqueue_error(state, auth, req.model, request_id, exc.status)
+        await _enqueue_error(state, auth, req.model, request_id, exc.status, release=release)
         raise
 
     latency_ms = (time.perf_counter() - request_t0) * 1000
