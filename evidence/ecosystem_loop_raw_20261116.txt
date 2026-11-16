@@ -1,0 +1,136 @@
+# 生态闭环演示 · 原始采证(脚本自动生成)
+- 时间: 2026-11-17 01:01:55
+- 口径: mock only 零现金;同机单进程;演示=链路与计费验证,回答质量无意义
+- 拓扑: askbi(:8200, LLM_PROVIDER=openai_compatible) → agentgate(:8100, SQLite+Redis+记账) → mock upstream(:8101)
+- 关键配置: PROFILE=full / AGENTGATE_MODELS=["demo-chat"] / vk model_whitelist=["demo-chat"] / tenant name=askbi
+
+===== S0 seed:租户 askbi + 专用 vk(白名单=[demo-chat],经 admin API) =====
+tenant_id=78929ccbf7d944cdbfb4a529c112bc5d (name=askbi)
+vk 签发: prefix=ag-unMuumu (raw 不落证据,仅运行目录暂存,退出即删)
+vk 关键字段: name=eco-demo, model_whitelist=["demo-chat"], rpm_limit=120, tpm_limit=200000, key/tenant 预算暂不设(S4 再设租户预算)
+{"status":"ok","db":"D:\\1\\1\\1Tasks\\zcode\\shixiproj\\askbi\\data\\askbi.duckdb","db_exists":true,"llm":"openai_compatible"}
+
+===== S1 场景一:askbi 两问(JSON 形态链路;轻量链路每问 2 次 LLM 调用:澄清→SQL) =====
+
+### S1-Q1(q=上月各渠道销售额是多少,墙钟 2033ms,SSE 帧数=19)
+data: {"type": "final", "task_id": "929fd69f5474", "answer": {"kind": "answer", "summary": "已按 channel 输出销售额明细，共 5 行", "narrative": "查询已成功执行,数据表与图表展示了各分组的销售额构成,排名依据销售额降序排列。具体数值请以表格数据为准,如需进一步拆分到其他维度可以继续追问。", "table": {"columns": ["channel", "value"], "rows": [["官网", 1088496.9738100006], ["直播", 970950.5639099983], ["推荐", 711239.428709999], ["搜索", 661484.6586400005], ["社交", 556504.7067800007]]}, "chart": {"$schema": "https://vega.github.io/schema/vega-lite/v5.json", "mark": "bar", "data": {"values": [{"channel": "社交", "value": 556504.7067800007}, {"channel": "搜索", "value": 661484.6586400005}, {"channel": "推荐", "value": 711239.428709999}, {"channel": "直播", "value": 970950.5639099983}, {"channel": "官网", "value": 1088496.9738100006}]}, "encoding": {"x": {"field": "channel", "type": "nominal"}, "y": {"field": "value", "type": "quantitative"}, "tooltip": [{"field": "channel"}, {"field": "value"}]}}, "sql": "SELECT o.channel AS channel, SUM(oi.quantity * oi.unit_price * (1 - oi.discount)) AS value\nFROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id JOIN customers c ON o.customer_id = c.customer_id\nWHERE strftime('%Y-%m', o.order_date) >= strftime('%Y-%m', date_trunc('month', DATE '2026-09-01') - INTERVAL (0) MONTH)\nGROUP BY o.channel\nORDER BY value DESC\nLIMIT 100", "caliber": "指标口径｜销售额：折后销售额 = Σ(数量×单价×(1-折扣))，含所有订单状态", "qa": {"passed": true, "deterministic_issues": [], "llm_issues": [], "numbers_checked": 0, "revision": 0}, "data_badge": {"row_count": 5, "truncated": false, "elapsed_ms": 21.7, "from_cache": false, "degraded": false}}, "usage": {"clarifier": {"prompt_tokens": 198, "completion_tokens": 86}, "sql_agent": {"prompt_tokens": 349, "completion_tokens": 110}, "insight": {"prompt_tokens": 109, "completion_tokens": 81}, "qa": {"prompt_tokens": 77, "completion_tokens": 71}}, "elapsed_ms": 968.7}
+
+### gateway /admin/tenants/…/usage · S1-Q1 后
+{"tenant_id": "78929ccbf7d944cdbfb4a529c112bc5d", "start": null, "end": null, "requests": 4, "total_tokens": 1081, "by_model": {"demo-chat": {"requests": 4, "total_tokens": 1081}}}
+
+### S1-Q2(q=最近三个月销售额趋势如何,墙钟 1438ms,SSE 帧数=19)
+data: {"type": "final", "task_id": "c2ae2a71c51d", "answer": {"kind": "answer", "summary": "已按 month 输出销售额明细，共 3 行", "narrative": "查询已成功执行,数据表与图表展示了各分组的销售额构成,排名依据销售额降序排列。具体数值请以表格数据为准,如需进一步拆分到其他维度可以继续追问。", "table": {"columns": ["month", "value"], "rows": [["2026-08", 4140510.2870499915], ["2026-09", 3988676.331850006], ["2026-07", 3892368.425840015]]}, "chart": {"$schema": "https://vega.github.io/schema/vega-lite/v5.json", "mark": "line", "data": {"values": [{"month": "2026-08", "value": 4140510.2870499915}, {"month": "2026-09", "value": 3988676.331850006}, {"month": "2026-07", "value": 3892368.425840015}]}, "encoding": {"x": {"field": "month", "type": "temporal", "timeUnit": "yearmonth"}, "y": {"field": "value", "type": "quantitative"}, "tooltip": [{"field": "month"}, {"field": "value"}]}}, "sql": "SELECT strftime('%Y-%m', o.order_date) AS month, SUM(oi.quantity * oi.unit_price * (1 - oi.discount)) AS value\nFROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id JOIN customers c ON o.customer_id = c.customer_id\nWHERE strftime('%Y-%m', o.order_date) >= strftime('%Y-%m', date_trunc('month', DATE '2026-09-01') - INTERVAL (2) MONTH)\nGROUP BY strftime('%Y-%m', o.order_date)\nORDER BY value DESC\nLIMIT 100", "caliber": "指标口径｜销售额：折后销售额 = Σ(数量×单价×(1-折扣))，含所有订单状态", "qa": {"passed": true, "deterministic_issues": [], "llm_issues": [], "numbers_checked": 0, "revision": 0}, "data_badge": {"row_count": 3, "truncated": false, "elapsed_ms": 18.0, "from_cache": false, "degraded": false}}, "usage": {"clarifier": {"prompt_tokens": 199, "completion_tokens": 86}, "sql_agent": {"prompt_tokens": 347, "completion_tokens": 108}, "insight": {"prompt_tokens": 341, "completion_tokens": 81}, "qa": {"prompt_tokens": 77, "completion_tokens": 71}}, "elapsed_ms": 561.1}
+
+### gateway /admin/tenants/…/usage · S1-Q2 后
+{"tenant_id": "78929ccbf7d944cdbfb4a529c112bc5d", "start": null, "end": null, "requests": 8, "total_tokens": 2391, "by_model": {"demo-chat": {"requests": 8, "total_tokens": 2391}}}
+
+
+===== S2 场景二:直连网关 SSE(stream=true,流式形态补证——askbi 客户端为非流式,见口径声明) =====
+
+### S2 SSE 帧(共 18 行,截前 8 + 末 3)
+data: {"id": "chatcmpl-eco-009", "object": "chat.completion.chunk", "created": 1794848516, "model": "demo-chat", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-eco-009", "object": "chat.completion.chunk", "created": 1794848516, "model": "demo-chat", "choices": [{"index": 0, "delta": {"content": "mock rep"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-eco-009", "object": "chat.completion.chunk", "created": 1794848516, "model": "demo-chat", "choices": [{"index": 0, "delta": {"content": "ly: 链路贯通"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-eco-009", "object": "chat.completion.chunk", "created": 1794848516, "model": "demo-chat", "choices": [{"index": 0, "delta": {"content": "(askbi→a"}, "finish_reason": null}]}
+
+……
+
+data: [DONE]
+
+
+
+===== S3 场景三:模型白名单闸(model 不在 vk 白名单 → 403 model_not_allowed) =====
+
+### S3 白名单 403 信封(status=403)
+{"error":{"message":"model 'gpt-4o' not allowed for this key","type":"invalid_request_error","code":"model_not_allowed","request_id":"917a0cf424a4461c8984445e748519d5"}}
+
+
+===== S4 场景四:租户预算兜底闸(把租户预算设为=已花费 → 下一次 LLM 调用 402) =====
+
+### gateway /admin/tenants/…/usage · S4 设闸前
+{"tenant_id": "78929ccbf7d944cdbfb4a529c112bc5d", "start": null, "end": null, "requests": 9, "total_tokens": 2516, "by_model": {"demo-chat": {"requests": 9, "total_tokens": 2516}}}
+已花费 total_tokens=2516 → 租户预算设为 2516(判定为 >=,下一次调用必 402): {"tenant_id":"78929ccbf7d944cdbfb4a529c112bc5d","budget_tokens":2516,"spent_tokens":2516}
+auth 缓存 DEL(vk:sha256(raw)) → 删 1 键,新预算立即生效
+
+### S4a 直连探测:租户预算信封(status=402)
+{"error":{"message":"tenant budget exhausted","type":"insufficient_quota","code":"tenant_budget_exceeded","request_id":"86362beaecb348a680131e9f8a41e446"}}
+
+### S4b askbi 行为:LLM 调用 402 → LLMError 不重试 → 节点诚实降级(澄清放行/SQL 拒答)
+
+### S4b 402 后(租户预算已耗尽)(q=上月华南销售额是多少,墙钟 886ms,SSE 帧数=10)
+data: {"type": "final", "task_id": "1b0fbfed7902", "answer": {"kind": "refusal", "message": "查询生成服务暂时不可用，请稍后重试"}, "usage": {}, "elapsed_ms": 14.1}
+
+
+===== S5 采证:usage 聚合 / metrics / 账本行样本 =====
+
+### gateway /admin/tenants/…/usage · 终态
+{"tenant_id": "78929ccbf7d944cdbfb4a529c112bc5d", "start": null, "end": null, "requests": 9, "total_tokens": 2516, "by_model": {"demo-chat": {"requests": 9, "total_tokens": 2516}}}
+
+### gateway /metrics(agentgate_ 相关行)
+agentgate_requests_total{channel="mock-openai",status_class="2xx",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 9.0
+agentgate_requests_created{channel="mock-openai",status_class="2xx",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 1.7948485268933804e+09
+agentgate_tokens_total{kind="prompt",model="demo-chat",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 1747.0
+agentgate_tokens_total{kind="completion",model="demo-chat",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 769.0
+agentgate_tokens_created{kind="prompt",model="demo-chat",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 1.7948485268933804e+09
+agentgate_tokens_created{kind="completion",model="demo-chat",tenant="78929ccbf7d944cdbfb4a529c112bc5d"} 1.7948485268933804e+09
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="5.0"} 3.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="10.0"} 7.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="25.0"} 7.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="50.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="100.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="250.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="500.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="1000.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="2500.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="5000.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="10000.0"} 8.0
+agentgate_request_latency_ms_bucket{channel="mock-openai",le="+Inf"} 8.0
+agentgate_request_latency_ms_count{channel="mock-openai"} 8.0
+agentgate_request_latency_ms_sum{channel="mock-openai"} 70.34789994941093
+agentgate_request_latency_ms_created{channel="mock-openai"} 1.7948485268933804e+09
+agentgate_ttft_ms_bucket{channel="mock-openai",le="10.0"} 0.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="25.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="50.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="100.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="200.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="400.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="800.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="1600.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="3200.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="6400.0"} 1.0
+agentgate_ttft_ms_bucket{channel="mock-openai",le="+Inf"} 1.0
+agentgate_ttft_ms_count{channel="mock-openai"} 1.0
+agentgate_ttft_ms_sum{channel="mock-openai"} 20.57
+agentgate_ttft_ms_created{channel="mock-openai"} 1.794848531169859e+09
+agentgate_usage_queue_depth 0.0
+agentgate_tasks_dead_total 0.0
+agentgate_tasks_dead_created 1.7948485197774262e+09
+agentgate_cache_hits_total 0.0
+agentgate_cache_hits_created 1.7948485197774262e+09
+
+(共 43 行 agentgate_ 指标,截 40)
+
+### 账本行样本(usage_records,SQLite 直接读)
+REQUEST_ID | TENANT_ID | MODEL | PROMPT_TOKENS | COMPLETION_TOKENS | TOTAL_TOKENS | TTFT_MS | LATENCY_MS | STATUS | CHANNEL | COST
+e0947290323544ea8b73696e5306520e | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 198 | 86 | 284 |  | 31 | 200 | mock-openai | 
+d8c354efdf1c4788bb4bd5f84154b299 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 349 | 110 | 459 |  | 7 | 200 | mock-openai | 
+e5f4374e3e0449589e34f66bef5722f8 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 77 | 71 | 148 |  | 3 | 200 | mock-openai | 
+ea0c9477745c4dba9f1894e15655d5b4 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 109 | 81 | 190 |  | 6 | 200 | mock-openai | 
+df9b27043ae0417b80ee89122d8a2a76 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 199 | 86 | 285 |  | 4 | 200 | mock-openai | 
+40240b13e3ce4c66aa1612d6c20fef99 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 347 | 108 | 455 |  | 4 | 200 | mock-openai | 
+b162962fa9364caa99aeb55e810d814b | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 341 | 81 | 422 |  | 5 | 200 | mock-openai | 
+1487d45c80f74efc948e4ba63c2e3311 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 77 | 71 | 148 |  | 5 | 200 | mock-openai | 
+427f98baae0d4c51933cb69397f4d722 | 78929ccbf7d944cdbfb4a529c112bc5d | demo-chat | 50 | 75 | 125 | 20.57 | 21 | 200 | mock-openai | 
+-- 共 9 行
+===== 清理:演示进程清点 =====
+killed pid=512
+killed pid=514
+killed pid=522
+killed pid=551
+PORT 8100 已关闭
+PORT 8101 已关闭
+PORT 8200 已关闭
+PORT 6399 已关闭
