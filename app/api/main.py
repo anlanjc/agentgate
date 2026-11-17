@@ -98,6 +98,16 @@ def create_app(
             await semantic_pg.ensure_table(app_.state.engine, settings.semantic_pg_vector_dim)
         # 生产启动:从 channels 表恢复渠道注册(运行时注册的重启不丢)
         await load_channels_from_db(app_)
+        # 混沌 round 3(2026-11-18):worker 启动时收尸 SIGKILL 残留的死进程 gauge
+        # 文件 —— GATE-6 只覆盖优雅停运与容器重启,k8s 下 master 进程内重启 worker
+        # 两者都够不到,死 worker 的 gauge_live 冻结值会被永久并入抓取(见
+        # metrics.cleanup_dead_process_files docstring)。
+        try:
+            from app.observability.metrics import cleanup_dead_process_files
+
+            cleanup_dead_process_files()
+        except Exception as exc:
+            logger.warning("multiproc_cleanup_failed", error=str(exc))
         # 启动 outbox sweeper/消费者;Redis 暂时不可用时由首次 enqueue 惰性重试。
         try:
             await app_.state.task_queue.start()
