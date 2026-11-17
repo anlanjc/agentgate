@@ -18,7 +18,7 @@
 
 | 验收项 | 目标 | 实测 | 口径 |
 |---|---|---|---|
-| 每请求附加开销 | < 10ms | **3.55ms** ✅(P1 重测现行口径) | c=1 无排队差值法;hardening 后 2000 req 复测;`scripts/load_test.py`(evidence/load_report.md) |
+| 每请求附加开销 | < 10ms | **2.37ms** ✅(round 2 现行口径,2026-11-18 GATE 修复后重测;历史 3.55ms) | c=1 无排队差值法;2000 req 复测;`scripts/load_test.py`(evidence/load_report_r2_20261118.md;热路径 4 往返实证见 §③ round 2) |
 | 并发扣减零超卖 | 桶硬上界 | **100 并发恰放行 50**(容量 50)✅ | 真 Redis Lua,`test_bucket_concurrent_zero_oversell` |
 | 记账原子性 | 零丢失 | **100 并发恰 1800 token、账本 100 行** ✅ | `test_concurrent_accounting_atomic` |
 | 故障注入:全渠道 500 | 透传+降级 | 透传最后错误,渠道头=exhausted;Redis 关停路由降级不崩 ✅ | `test_all_channels_fail_passthrough` / `test_redis_down_router_degrades` |
@@ -37,6 +37,22 @@
   DB 会话;记账 INCRBY+窗口 → pipeline;路由 EMA 读改写 → 原子 Lua。**每请求 Redis 往返 8→5**。
 - **诚实结论**:单进程绝对吞吐受 GIL/事件循环约束(本机 Proactor ~300-450 req/s;Selector 实测
   c=50 略好但 c=1 更差,未采纳);生产 `uvicorn --workers N` 水平扩展,与 LiteLLM 部署形态一致。
+
+### 性能档案 round 2(2026-11-18,[1B4-AG]):GATE 修复后重测 + 热路径往返实证
+
+> 背景:评审 4.0 修复轮(GATE-2 `_slot_guard`/GATE-9 Redis TIME Lua/GATE-5 cleanup_expired+DLQ XTRIM/GATE-6 multiproc metrics)全部落在请求路径或其周边,需重验"修复无热路径回归"。同脚本同参数重跑(evidence/load_report_r2_20261118.md / load_workers_r2_20261118.md)。
+
+| 项 | 旧口径(2026-11-03) | round 2(2026-11-18) | 判读 |
+|---|---|---|---|
+| 每请求附加开销(c=1 差值) | 3.55ms | **2.37ms** | 改善 1.18ms;归因见下 |
+| c=50 非流式吞吐 | 306 req/s | **369 req/s** | +21%,与裸基线漂移同向 |
+| 裸 mock 基线 | 1851 req/s | 2282 req/s | **+23% 机器态漂移的对照锚** |
+| 水平扩展 | 1.00→2.09→4.95x | **1.00→2.16→4.55x** | 同量级(4 档超线性来自本机噪声,两轮互证) |
+
+- **热路径 Redis 往返数实证(commandstats 差分,两窗法扣除 background)**:非流式请求前台恰好 **4 次往返** = 鉴权缓存 GET(1)+ 准入单 Lua EVALSHA(1,内嵌 TIME/HMGET/INCRBY/HMSET/PEXPIRE)+ 路由 candidates pipeline(TIME+HGETALL,1)+ mark_success 原子 EMA Lua(1,内嵌 TIME/HSET);记账 XADD 与消费(XREADGROUP/XACK/XDEL)全在 BackgroundTask/消费循环,不在延迟路径。
+- **GATE 修复热路径影响如实**:GATE-2 slot guard = 闭包创建,无并发限档位时零往返(429/409 收尾路径才 DECR);GATE-9 candidates 的 TIME 挂进既有 pipeline(往返数不变,修的是时钟源),mark_* Lua 化只在失败路径;GATE-5 cleanup_expired=PG 口径写路径节流、DLQ XTRIM=死信事件旁路——均非热路径。**结论:四项 GATE 修复零热路径往返增量,实测无回归。**
+- **c=1 改善(3.55→2.37ms)归因**:往返结构不变(4 次)→ 差值主要来自机器态漂移(裸基线 +23% 为佐证);差值法抵消客户端成本但抵消不了机器负载态。不宣称代码性改善。
+- **真瓶颈搜索(候选:语义缓存命中路径/准入 Lua 合并度/audit 写路径)**:三项均无新瓶颈——语义缓存缺省 `semantic_cache_enabled=False` 不在热路径;准入已是单 Lua 单往返;audit 记账已是 BackgroundTask+Streams 异步。**本轮不触发"发现真瓶颈→优化"分支,结论=修复轮无回归,性能档案续期。**
 
 ## ④ 环境与口径分列
 
